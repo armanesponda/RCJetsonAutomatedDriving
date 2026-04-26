@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset, random_split
 from dataset import LaneDataset
 from model import build_model
 
@@ -10,10 +10,8 @@ EPOCHS     = 30
 BATCH_SIZE = 4
 LR         = 1e-4
 SAVE_PATH  = "best_model.pth"
-
-# Roboflow puts these folders in the zip you download
-TRAIN_DIR  = "data/train"
-VAL_DIR    = "data/valid"
+DATA_DIR   = "data"
+VAL_SPLIT  = 0.2   # 80/20 train/val
 
 def iou(pred, target, cls=1):
     pred   = (pred == cls)
@@ -43,8 +41,16 @@ def run_epoch(model, loader, optimizer, criterion, train=True):
 
 
 def main():
-    train_set = LaneDataset(TRAIN_DIR, augment=True)
-    val_set   = LaneDataset(VAL_DIR,   augment=False)
+    # Split indices 80/20 with a fixed seed for reproducibility
+    full     = LaneDataset(DATA_DIR, augment=False)
+    n_val    = max(1, int(VAL_SPLIT * len(full)))
+    n_train  = len(full) - n_val
+    train_sub, val_sub = random_split(full, [n_train, n_val],
+                                      generator=torch.Generator().manual_seed(42))
+
+    # Re-wrap train indices with augmentation enabled
+    train_set = Subset(LaneDataset(DATA_DIR, augment=True),  train_sub.indices)
+    val_set   = Subset(LaneDataset(DATA_DIR, augment=False), val_sub.indices)
 
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2)
     val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
