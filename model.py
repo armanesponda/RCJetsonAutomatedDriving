@@ -16,6 +16,6 @@ def build_model(num_classes=NUM_CLASSES, pretrained=True):
 
 def load_checkpoint(path, device="cpu"):
     model = build_model(pretrained=False)
-    model.load_state_dict(torch.load(path, map_location=device))
+    model.load_state_dict(torch.load(path, map_location=device), strict=False)
     model.to(device)
     return model
