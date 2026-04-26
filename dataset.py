@@ -6,11 +6,10 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 
-# Roboflow COCO Segmentation export layout:
+# Expected layout:
 #   data/
-#     train/  images/ + _annotations.coco.json
-#     valid/  images/ + _annotations.coco.json
-#     test/   images/ + _annotations.coco.json
+#     images/
+#     _annotations.coco.json
 
 class LaneDataset(Dataset):
     def __init__(self, split_dir, size=(520, 520), augment=False):
@@ -40,8 +39,11 @@ class LaneDataset(Dataset):
         mask = Image.new("L", (w, h), 0)
         draw = ImageDraw.Draw(mask)
         for ann in self.anns.get(info["id"], []):
-            for seg in ann["segmentation"]:
-                if len(seg) >= 6:
+            segs = ann["segmentation"]
+            if not isinstance(segs, list):
+                continue  # skip RLE-encoded annotations
+            for seg in segs:
+                if isinstance(seg, list) and len(seg) >= 6:
                     poly = [(float(seg[i]), float(seg[i + 1])) for i in range(0, len(seg), 2)]
                     draw.polygon(poly, fill=1)
 
