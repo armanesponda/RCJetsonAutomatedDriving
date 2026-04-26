@@ -1,10 +1,12 @@
 import os
 import json
 import random
+import numpy as np
 from PIL import Image, ImageDraw
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
+from pycocotools import mask as coco_mask
 
 # Expected layout:
 #   data/
@@ -35,17 +37,24 @@ class LaneDataset(Dataset):
         image = Image.open(os.path.join(self.img_dir, info["file_name"])).convert("RGB")
         w, h  = image.size
 
-        # Rasterize polygon annotations → binary mask (0=background, 1=lane)
-        mask = Image.new("L", (w, h), 0)
-        draw = ImageDraw.Draw(mask)
+        # Rasterize annotations → binary mask (0=background, 1=lane)
+        mask_arr = np.zeros((h, w), dtype=np.uint8)
+        draw     = ImageDraw.Draw(Image.new("L", (w, h), 0))
         for ann in self.anns.get(info["id"], []):
             segs = ann["segmentation"]
-            if not isinstance(segs, list):
-                continue  # skip RLE-encoded annotations
-            for seg in segs:
-                if isinstance(seg, list) and len(seg) >= 6:
-                    poly = [(float(seg[i]), float(seg[i + 1])) for i in range(0, len(seg), 2)]
-                    draw.polygon(poly, fill=1)
+            if isinstance(segs, dict):
+                # RLE (pixel brush) annotation — decode with pycocotools
+                mask_arr |= coco_mask.decode(segs)
+            elif isinstance(segs, list):
+                # Polygon annotation — rasterize manually
+                tmp  = Image.new("L", (w, h), 0)
+                d    = ImageDraw.Draw(tmp)
+                for seg in segs:
+                    if isinstance(seg, list) and len(seg) >= 6:
+                        poly = [(float(seg[i]), float(seg[i + 1])) for i in range(0, len(seg), 2)]
+                        d.polygon(poly, fill=1)
+                mask_arr |= np.array(tmp)
+        mask = Image.fromarray(mask_arr)
 
         image = image.resize(self.size, Image.BILINEAR)
         mask  = mask.resize(self.size,  Image.NEAREST)
