@@ -58,12 +58,16 @@ def generate_frames():
         tensor = preprocess(frame).to(DEVICE)
         with torch.no_grad():
             out  = model(tensor)["out"]          # [1, 2, H, W]
-        pred = out.argmax(dim=1).squeeze(0).cpu().numpy()   # [H, W]
+
+        import torch.nn.functional as F
+        probs     = F.softmax(out, dim=1)        # [1, 2, H, W]
+        lane_prob = probs[0, 1]                  # [H, W] probability of lane class
+        max_conf  = float(lane_prob.max().cpu())
+        pred      = out.argmax(dim=1).squeeze(0).cpu().numpy()   # [H, W]
 
         annotated = overlay_mask(frame, pred)
 
-        # Burn device + class info into the corner so you can confirm GPU is active
-        label = f"{DEVICE.upper()}  lane px: {int(pred.sum())}"
+        label = f"{DEVICE.upper()}  lane px: {int(pred.sum())}  max conf: {max_conf:.2f}"
         cv2.putText(annotated, label, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
