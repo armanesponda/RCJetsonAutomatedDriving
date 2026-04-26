@@ -8,7 +8,7 @@ from model import load_checkpoint
 
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "best_model.pth"
-INPUT_SIZE = (520, 520)
+INPUT_SIZE = (640, 360)
 PORT       = 5001
 
 # ── Camera ─────────────────────────────────────────────────────────────

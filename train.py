@@ -7,7 +7,8 @@ from model import build_model
 # ── Config ─────────────────────────────────────────────────────────
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 EPOCHS     = 30
-BATCH_SIZE = 4
+BATCH_SIZE = 2
+IMG_SIZE   = (640, 360)
 LR         = 1e-4
 SAVE_PATH  = "best_model.pth"
 DATA_DIR   = "data"
@@ -42,17 +43,18 @@ def run_epoch(model, loader, optimizer, criterion, train=True):
 
 def main():
     # Split indices 80/20 with a fixed seed for reproducibility
-    full     = LaneDataset(DATA_DIR, augment=False)
+    full     = LaneDataset(DATA_DIR, size=IMG_SIZE, augment=False)
     n_val    = max(1, int(VAL_SPLIT * len(full)))
     n_train  = len(full) - n_val
     train_sub, val_sub = random_split(full, [n_train, n_val],
                                       generator=torch.Generator().manual_seed(42))
 
     # Re-wrap train indices with augmentation enabled
-    train_set = Subset(LaneDataset(DATA_DIR, augment=True),  train_sub.indices)
-    val_set   = Subset(LaneDataset(DATA_DIR, augment=False), val_sub.indices)
+    train_set = Subset(LaneDataset(DATA_DIR, size=IMG_SIZE, augment=True),  train_sub.indices)
+    val_set   = Subset(LaneDataset(DATA_DIR, size=IMG_SIZE, augment=False), val_sub.indices)
 
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2)
+    # drop_last=True prevents a single-sample batch which breaks BatchNorm in ASPP
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2, drop_last=True)
     val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
 
     print(f"Train: {len(train_set)}  Val: {len(val_set)}  Device: {DEVICE}")
