@@ -63,7 +63,7 @@ def generate_frames():
         probs     = F.softmax(out, dim=1)        # [1, 2, H, W]
         lane_prob = probs[0, 1]                  # [H, W] probability of lane class
         max_conf  = float(lane_prob.max().cpu())
-        pred      = out.argmax(dim=1).squeeze(0).cpu().numpy()   # [H, W]
+        pred      = (lane_prob.cpu().numpy() > 0.25).astype(int)  # [H, W]
 
         annotated = overlay_mask(frame, pred)
 
