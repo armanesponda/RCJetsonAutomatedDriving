@@ -42,7 +42,7 @@ class LaneDataset(Dataset):
         for ann in self.anns.get(info["id"], []):
             for seg in ann["segmentation"]:
                 if len(seg) >= 6:
-                    poly = [(seg[i], seg[i + 1]) for i in range(0, len(seg), 2)]
+                    poly = [(float(seg[i]), float(seg[i + 1])) for i in range(0, len(seg), 2)]
                     draw.polygon(poly, fill=1)
 
         image = image.resize(self.size, Image.BILINEAR)
