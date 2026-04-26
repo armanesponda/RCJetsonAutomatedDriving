@@ -44,7 +44,11 @@ class LaneDataset(Dataset):
             segs = ann["segmentation"]
             if isinstance(segs, dict):
                 # RLE (pixel brush) annotation — decode with pycocotools
-                mask_arr |= coco_mask.decode(segs)
+                # Roboflow stores size as [w, h] instead of COCO standard [h, w], so transpose
+                decoded = coco_mask.decode(segs)
+                if decoded.shape != mask_arr.shape:
+                    decoded = decoded.T
+                mask_arr |= decoded
             elif isinstance(segs, list):
                 # Polygon annotation — rasterize manually
                 tmp  = Image.new("L", (w, h), 0)
