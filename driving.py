@@ -22,7 +22,7 @@ DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "best_model.pth"
 INPUT_SIZE = (640, 360)   # width, height fed to the model
 PORT       = 5000
-SPEED      = 60           # default motor speed (0–100)
+SPEED      = 20           # default motor speed (0–100)
 
 # ── Pin definitions (BCM numbering) ────────────────────────────────────────────
 ENA = 17   # Left motor PWM   (board pin 11)
@@ -34,6 +34,9 @@ IN4 = 20   # Right backward   (board pin 38)
 
 LEFT_TRIM  = 1.0    # scale left  motor to correct physical drift
 RIGHT_TRIM = 0.85   # scale right motor to correct physical drift
+
+MIN_BLOB_AREA = 200 #for smaller blobs that are noise
+STEER_DEADBAND = 0.10 #10% of the frame width counts as centered
 
 
 # ── SoftPWM ────────────────────────────────────────────────────────────────────
@@ -176,27 +179,10 @@ def overlay_mask(frame, mask):
     return cv2.addWeighted(frame, 0.7, green_layer, 0.3, 0)
 
 
-# ── Steering logic ────────────────────────────────────────────────────────────
-# `mask`  — boolean numpy array (model_H, model_W), True = blue tape pixel
-# returns — one of: "forward", "turn_left", "turn_right", "stop"
-#
-# Strategy:
-#   1. Label connected blobs in the mask with cv2.connectedComponentsWithStats
-#   2. Keep only blobs above a minimum area (noise filter)
-#   3. Sort surviving blobs by centroid Y descending → highest Y = closest to car
-#   4. Take the two closest blobs (left and right lane lines)
-#   5. Average their centroid X coords → estimated lane center
-#   6. Compare lane center to image center → signed steering error
-#   7. Dead-band in the middle → forward; outside dead-band → turn
-
-MIN_BLOB_AREA  = 200    # pixels; blobs smaller than this are noise
-STEER_DEADBAND = 0.10   # ±10 % of frame width counts as "centered"
-
 def decide_steering(mask):
     mask_u8 = mask.astype(np.uint8)
     num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(mask_u8)
 
-    # Collect valid blobs (skip label 0 = background)
     blobs = [
         (centroids[i], stats[i, cv2.CC_STAT_AREA])
         for i in range(1, num_labels)
@@ -204,28 +190,14 @@ def decide_steering(mask):
     ]
 
     if len(blobs) == 0:
-        return "stop"   # no lane visible
-
-    # Sort by centroid Y descending so index 0 is closest to the car
+        return "stop"
+    
     blobs.sort(key=lambda b: b[0][1], reverse=True)
+    num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(mask_u8)
 
-    # Use up to the two closest blobs to estimate lane center
-    top_blobs   = blobs[:2]
-    lane_cx     = float(np.mean([b[0][0] for b in top_blobs]))   # average X
-    frame_w     = mask.shape[1]
-    image_cx    = frame_w / 2.0
-
-    # Normalised error: negative = lane center left of image center → turn left
-    #                   positive = lane center right of image center → turn right
-    error = (lane_cx - image_cx) / frame_w   # range roughly [-0.5, +0.5]
-
-    if error > STEER_DEADBAND:
-        return "turn_right"
-    elif error < -STEER_DEADBAND:
-        return "turn_left"
-    else:
-        return "forward"
-
+    blobs = [
+        
+    ]
 
 # ── Thread 2: inference + motor control ────────────────────────────────────────
 # Reads the latest camera frame, runs the segmentation model, decides a steering
@@ -293,6 +265,11 @@ PAGE = """
 </html>
 """
 
+def keyboard_listener():
+    while True:
+        if input().strip().lower() == 'q':
+            shutdown(None, None)
+
 def mjpeg_generator():
     while True:
         with annotated_lock:
@@ -342,6 +319,7 @@ if __name__ == "__main__":
     model.eval()
     print("Model ready.")
 
+    threading.Thread(target=keyboard_listener, daemon=True).start()
     threading.Thread(target=capture_loop,   daemon=True).start()
     threading.Thread(target=inference_loop, daemon=True).start()
 
