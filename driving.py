@@ -32,9 +32,6 @@ ENB = 27   # Right motor PWM  (board pin 13)
 IN3 = 16   # Right forward    (board pin 36)
 IN4 = 20   # Right backward   (board pin 38)
 
-LEFT_TRIM  = 1.0    # scale left  motor to correct physical drift
-RIGHT_TRIM = 0.85   # scale right motor to correct physical drift
-
 MIN_BLOB_AREA = 200 #for smaller blobs that are noise
 STEER_DEADBAND = 0.10 #10% of the frame width counts as centered
 
@@ -101,28 +98,28 @@ def stop_motors():
 def forward(speed=SPEED):
     GPIO.output(IN1, GPIO.HIGH); GPIO.output(IN2, GPIO.LOW)
     GPIO.output(IN3, GPIO.HIGH); GPIO.output(IN4, GPIO.LOW)
-    pwm_left.ChangeDutyCycle(speed * LEFT_TRIM)
-    pwm_right.ChangeDutyCycle(speed * RIGHT_TRIM)
+    pwm_left.ChangeDutyCycle(speed)
+    pwm_right.ChangeDutyCycle(speed)
 
 def backward(speed=SPEED):
     GPIO.output(IN1, GPIO.LOW);  GPIO.output(IN2, GPIO.HIGH)
     GPIO.output(IN3, GPIO.LOW);  GPIO.output(IN4, GPIO.HIGH)
-    pwm_left.ChangeDutyCycle(speed * LEFT_TRIM)
-    pwm_right.ChangeDutyCycle(speed * RIGHT_TRIM)
+    pwm_left.ChangeDutyCycle(speed)
+    pwm_right.ChangeDutyCycle(speed)
 
 def turn_left(speed=SPEED):
     # Left wheel reverses while right wheel goes forward → pivot left
     GPIO.output(IN1, GPIO.LOW);  GPIO.output(IN2, GPIO.HIGH)
     GPIO.output(IN3, GPIO.HIGH); GPIO.output(IN4, GPIO.LOW)
-    pwm_left.ChangeDutyCycle(speed * LEFT_TRIM)
-    pwm_right.ChangeDutyCycle(speed * RIGHT_TRIM)
+    pwm_left.ChangeDutyCycle(speed)
+    pwm_right.ChangeDutyCycle(speed)
 
 def turn_right(speed=SPEED):
     # Right wheel reverses while left wheel goes forward → pivot right
     GPIO.output(IN1, GPIO.HIGH); GPIO.output(IN2, GPIO.LOW)
     GPIO.output(IN3, GPIO.LOW);  GPIO.output(IN4, GPIO.HIGH)
-    pwm_left.ChangeDutyCycle(speed * LEFT_TRIM)
-    pwm_right.ChangeDutyCycle(speed * RIGHT_TRIM)
+    pwm_left.ChangeDutyCycle(speed)
+    pwm_right.ChangeDutyCycle(speed)
 
 
 # ── Camera ─────────────────────────────────────────────────────────────────────
