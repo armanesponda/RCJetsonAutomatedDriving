@@ -22,7 +22,9 @@ DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "best_model.pth"
 INPUT_SIZE = (640, 360)   # width, height fed to the model
 PORT       = 5000
-SPEED      = 45          # default motor speed (0–100)
+SPEED          = 50   # straight speed (0–100)
+SPEED_TURN     = 35   # speed while turning
+SPEED_RECOVER  = 30   # speed while searching for lane (no blobs)
 
 # ── Pin definitions (BCM numbering) ────────────────────────────────────────────
 ENA = 17   # Left motor PWM   (board pin 11)
@@ -140,6 +142,9 @@ annotated_frame = None   # frame with lane mask overlay drawn on it
 frame_lock      = threading.Lock()
 annotated_lock  = threading.Lock()
 
+autonomous      = False  # toggled by Enter key; car only drives when True
+auto_lock       = threading.Lock()
+
 
 # ── Thread 1: capture ──────────────────────────────────────────────────────────
 # Runs as fast as the camera allows; decouples capture rate from inference rate.
@@ -177,6 +182,7 @@ def overlay_mask(frame, mask):
 
 
 def decide_steering(mask):
+    """Returns (command, speed). 'recover' means no lane visible — turn right to search."""
     mask_u8 = mask.astype(np.uint8)
     _, w = mask_u8.shape
     num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(mask_u8)
@@ -188,20 +194,17 @@ def decide_steering(mask):
     ]
 
     if len(blobs) == 0:
-        return "stop"
+        return "recover", SPEED_RECOVER
 
-    # Use the largest blob's centroid to determine steering
     cx = max(blobs, key=lambda b: b[1])[0][0]
-
-    # Normalize offset: negative = lane left of center, positive = right
     error = (cx - w / 2) / (w / 2)
 
     if abs(error) < STEER_DEADBAND:
-        return "forward"
+        return "forward", SPEED
     elif error < 0:
-        return "turn_left"
+        return "turn_left", SPEED_TURN
     else:
-        return "turn_right"
+        return "turn_right", SPEED_TURN
 
 # ── Thread 2: inference + motor control ────────────────────────────────────────
 # Reads the latest camera frame, runs the segmentation model, decides a steering
@@ -227,22 +230,32 @@ def inference_loop():
         pred_mask = (lane_prob.cpu().numpy() > 0.25)   # boolean [H, W]
 
         # --- Motor control ---
-        command = decide_steering(pred_mask)
-        {"forward":   forward,
-         "backward":  backward,
-         "turn_left":  turn_left,
-         "turn_right": turn_right,
-         "stop":       stop_motors}[command]()
+        command, speed = decide_steering(pred_mask)
+
+        with auto_lock:
+            is_autonomous = autonomous
+
+        if not is_autonomous:
+            stop_motors()
+        elif command == "recover":
+            turn_right(SPEED_RECOVER)   # pivot right until lane reappears
+        else:
+            {"forward": forward, "turn_left": turn_left, "turn_right": turn_right}[command](speed)
 
         # --- Annotate frame for streaming ---
         vis = overlay_mask(frame, pred_mask.astype(int))
-        label = (f"{DEVICE.upper()}  cmd:{command}"
+        display_cmd = "recover→right" if command == "recover" else command
+        display_spd = speed if is_autonomous else 0
+        auto_str    = "AUTO" if is_autonomous else "IDLE (press Enter)"
+        label = (f"{auto_str}  cmd:{display_cmd}  spd:{display_spd}"
                  f"  lane px:{int(pred_mask.sum())}  conf:{max_conf:.2f}")
         cv2.putText(vis, label, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         with annotated_lock:
             annotated_frame = vis
+
+        time.sleep(0.1)   # ~10 Hz — reduces GPU/CPU load and battery drain
 
 
 # ── Flask: MJPEG stream ────────────────────────────────────────────────────────
@@ -270,9 +283,21 @@ PAGE = """
 """
 
 def keyboard_listener():
+    global autonomous
+    print("Controls: Enter = start/stop autonomous mode | q+Enter = quit")
     while True:
-        if input().strip().lower() == 'q':
+        key = input().strip().lower()
+        if key == 'q':
             shutdown(None, None)
+        else:
+            with auto_lock:
+                autonomous = not autonomous
+                state = autonomous
+            if state:
+                print("Autonomous ON  — car will drive")
+            else:
+                stop_motors()
+                print("Autonomous OFF — motors stopped")
 
 def mjpeg_generator():
     while True:
