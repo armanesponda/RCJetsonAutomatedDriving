@@ -22,7 +22,7 @@ DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "best_model.pth"
 INPUT_SIZE = (640, 360)   # width, height fed to the model
 PORT       = 5000
-SPEED      = 20           # default motor speed (0–100)
+SPEED      = 45          # default motor speed (0–100)
 
 # ── Pin definitions (BCM numbering) ────────────────────────────────────────────
 ENA = 17   # Left motor PWM   (board pin 11)
