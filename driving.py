@@ -285,12 +285,13 @@ def mjpeg_generator():
         if frame is None:
             time.sleep(0.05)
             continue
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        small = cv2.resize(frame, (320, 240))
+        ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 30])
         if not ok:
             continue
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
                + buf.tobytes() + b"\r\n")
-        time.sleep(1 / 20)   # cap stream at 20 fps to save bandwidth
+        time.sleep(1 / 10)   # cap stream at 10 fps to save bandwidth
 
 @app.route("/")
 def index():

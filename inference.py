@@ -71,7 +71,8 @@ def generate_frames():
         cv2.putText(annotated, label, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-        _, buf = cv2.imencode(".jpg", annotated)
+        small = cv2.resize(annotated, (320, 240))
+        _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 30])
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
                + buf.tobytes() + b"\r\n")
 
