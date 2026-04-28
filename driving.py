@@ -181,6 +181,7 @@ def overlay_mask(frame, mask):
 
 def decide_steering(mask):
     mask_u8 = mask.astype(np.uint8)
+    _, w = mask_u8.shape
     num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(mask_u8)
 
     blobs = [
@@ -191,13 +192,19 @@ def decide_steering(mask):
 
     if len(blobs) == 0:
         return "stop"
-    
-    blobs.sort(key=lambda b: b[0][1], reverse=True)
-    num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(mask_u8)
 
-    blobs = [
-        
-    ]
+    # Use the largest blob's centroid to determine steering
+    cx = max(blobs, key=lambda b: b[1])[0][0]
+
+    # Normalize offset: negative = lane left of center, positive = right
+    error = (cx - w / 2) / (w / 2)
+
+    if abs(error) < STEER_DEADBAND:
+        return "forward"
+    elif error < 0:
+        return "turn_left"
+    else:
+        return "turn_right"
 
 # ── Thread 2: inference + motor control ────────────────────────────────────────
 # Reads the latest camera frame, runs the segmentation model, decides a steering
