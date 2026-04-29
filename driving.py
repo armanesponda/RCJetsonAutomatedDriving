@@ -22,15 +22,15 @@ DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "best_model.pth"
 INPUT_SIZE = (640, 360)   # width, height fed to the model
 PORT       = 5000
-SPEED          = 50   # base forward duty cycle (0–100); both wheels at this on a perfect straight
-SPEED_LOST     = 25   # speed while coasting through a brief detection dropout
+SPEED          = 30   # base forward duty cycle (0–100); both wheels at this on a perfect straight
+SPEED_LOST     = 15   # speed while coasting through a brief detection dropout
 
 # ── Steering controller knobs ─────────────────────────────────────────────────
 # error ∈ [-1, +1]: -1 = lane center is at far left of frame, +1 = far right.
 # left_duty  = SPEED + STEER_GAIN * error
 # right_duty = SPEED - STEER_GAIN * error
 # Higher gain = sharper turns + more wobble. Tune on the car.
-STEER_GAIN          = 35
+STEER_GAIN          = 25
 ERROR_ALPHA         = 0.65   # EWMA on raw error: smaller = smoother but laggier
 LANE_WIDTH_DEFAULT  = 0.60   # initial lane width as a fraction of frame width
 LANE_WIDTH_ALPHA    = 0.85   # EWMA on lane-width estimate (slow update)
