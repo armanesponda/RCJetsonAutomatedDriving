@@ -38,7 +38,6 @@ INSIDE_REVERSE_CAP  = 30     # max reverse PWM for the inside wheel during sharp
                              # (negative = wheel briefly spins backward to tighten the pivot)
 LANE_WIDTH_DEFAULT  = 0.60   # initial lane width as a fraction of frame width
 LANE_WIDTH_ALPHA    = 0.85   # EWMA on lane-width estimate (slow update)
-BOUNDARY_MATCH_PX   = 120    # max horizontal jump for matching a blob to last frame's left/right boundary
 LOST_FRAMES_HOLD    = 25     # ~2.5s at 10Hz: hold last command this long before stopping
 STRIP_TOP_FRAC      = 0.25   # ignore top N of frame (horizon); use rows [N*h, h] for blob search.
                              # Lower = more detection range; raise toward 0.5 if distant noise misleads steering.
@@ -226,6 +225,18 @@ _locked_side   = None    # "left"|"right"|None — sticky identity for single-bl
                          # set on first single-blob frame, cleared when both blobs reappear
 
 
+def reset_steering_state():
+    """Wipe per-run state so a stale lock or ewma can't carry into a new attempt.
+    Lane-width estimate is intentionally kept — it's a slowly-changing physical
+    property and a good estimate from the previous run beats the default."""
+    global _prev_left_x, _prev_right_x, _error_ewma, _lost_count, _locked_side
+    _prev_left_x  = None
+    _prev_right_x = None
+    _error_ewma   = 0.0
+    _lost_count   = 0
+    _locked_side  = None
+
+
 def decide_steering(mask):
     """
     Returns (error, regime, debug).
@@ -262,6 +273,14 @@ def decide_steering(mask):
     # ── Regime: lost ──────────────────────────────────────────────────────────
     if not blobs:
         _lost_count += 1
+        # Past the hold window the motors are already off; the next reacquire
+        # should evaluate identity and error from scratch instead of resuming
+        # whatever turn was in progress when we lost sight.
+        if _lost_count > LOST_FRAMES_HOLD:
+            _prev_left_x  = None
+            _prev_right_x = None
+            _locked_side  = None
+            _error_ewma   = 0.0
         return _error_ewma, "lost", debug
 
     _lost_count = 0
@@ -470,6 +489,7 @@ def keyboard_listener():
                 autonomous = not autonomous
                 state = autonomous
             if state:
+                reset_steering_state()
                 print("Autonomous ON  — car will drive")
             else:
                 stop_motors()
@@ -517,7 +537,9 @@ def toggle():
     with auto_lock:
         autonomous = not autonomous
         state = autonomous
-    if not state:
+    if state:
+        reset_steering_state()
+    else:
         stop_motors()
     return jsonify(autonomous=state)
 
