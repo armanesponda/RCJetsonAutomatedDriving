@@ -132,6 +132,10 @@ if not cap.isOpened():
         if cap.isOpened():
             break
 
+if not cap.isOpened():
+    print("ERROR: could not open camera at /dev/video0, /dev/video1, or /dev/video2")
+    sys.exit(1)
+
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 30)
@@ -145,18 +149,28 @@ annotated_lock  = threading.Lock()
 autonomous      = False  # toggled by Enter key; car only drives when True
 auto_lock       = threading.Lock()
 
+# Watchdog: inference_loop bumps this on every successful pass.
+# If it goes stale while autonomous is on, the watchdog stops the motors
+# so a hung capture or GPU stall can't leave the wheels spinning.
+last_inference_ts = time.monotonic()
+WATCHDOG_TIMEOUT  = 1.0   # seconds
+
 
 # ── Thread 1: capture ──────────────────────────────────────────────────────────
 # Runs as fast as the camera allows; decouples capture rate from inference rate.
 def capture_loop():
     global latest_frame
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.05)
-            continue
-        with frame_lock:
-            latest_frame = frame
+        try:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.05)
+                continue
+            with frame_lock:
+                latest_frame = frame
+        except Exception as e:
+            print(f"capture_loop error: {e}")
+            time.sleep(0.1)
 
 
 # ── Preprocessing & visualization helpers ─────────────────────────────────────
@@ -222,52 +236,72 @@ def decide_steering(mask):
 # Reads the latest camera frame, runs the segmentation model, decides a steering
 # command, drives the motors, then writes an annotated frame for the web stream.
 def inference_loop():
-    global annotated_frame
+    global annotated_frame, last_inference_ts
     while True:
-        # Grab the most recent frame (non-blocking — skip if nothing new yet)
-        with frame_lock:
-            frame = latest_frame
-        if frame is None:
-            time.sleep(0.01)
-            continue
+        try:
+            # Grab the most recent frame (non-blocking — skip if nothing new yet)
+            with frame_lock:
+                frame = latest_frame
+            if frame is None:
+                time.sleep(0.01)
+                continue
 
-        # --- Inference ---
-        tensor = preprocess(frame).to(DEVICE)
-        with torch.no_grad():
-            out = model(tensor)["out"]          # [1, 2, H, W]  (logits)
+            # --- Inference ---
+            tensor = preprocess(frame).to(DEVICE)
+            with torch.no_grad():
+                out = model(tensor)["out"]          # [1, 2, H, W]  (logits)
 
-        probs     = F.softmax(out, dim=1)       # convert logits → probabilities
-        lane_prob = probs[0, 1]                 # [H, W]  probability of lane class
-        max_conf  = float(lane_prob.max().cpu())
-        pred_mask = (lane_prob.cpu().numpy() > 0.25)   # boolean [H, W]
+            probs     = F.softmax(out, dim=1)       # convert logits → probabilities
+            lane_prob = probs[0, 1]                 # [H, W]  probability of lane class
+            max_conf  = float(lane_prob.max().cpu())
+            pred_mask = (lane_prob.cpu().numpy() > 0.25)   # boolean [H, W]
 
-        # --- Motor control ---
-        command, speed = decide_steering(pred_mask)
+            # --- Motor control ---
+            command, speed = decide_steering(pred_mask)
 
+            with auto_lock:
+                is_autonomous = autonomous
+
+            if not is_autonomous:
+                stop_motors()
+            elif command == "recover":
+                turn_right(SPEED_RECOVER)   # pivot right until lane reappears
+            else:
+                {"forward": forward, "turn_left": turn_left, "turn_right": turn_right}[command](speed)
+
+            # --- Annotate frame for streaming ---
+            vis = overlay_mask(frame, pred_mask.astype(int))
+            display_cmd = "recover→right" if command == "recover" else command
+            display_spd = speed if is_autonomous else 0
+            auto_str    = "AUTO" if is_autonomous else "IDLE (press Enter)"
+            label = (f"{auto_str}  cmd:{display_cmd}  spd:{display_spd}"
+                     f"  lane px:{int(pred_mask.sum())}  conf:{max_conf:.2f}")
+            cv2.putText(vis, label, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            with annotated_lock:
+                annotated_frame = vis
+
+            last_inference_ts = time.monotonic()
+            time.sleep(0.1)   # ~10 Hz — reduces GPU/CPU load and battery drain
+        except Exception as e:
+            print(f"inference_loop error: {e}")
+            stop_motors()
+            time.sleep(0.1)
+
+
+# ── Thread 3: watchdog ─────────────────────────────────────────────────────────
+# If inference_loop hangs (camera stall, GPU lockup, etc.) the wheels would keep
+# spinning at whatever the last command was. This thread cuts power if no
+# successful inference has happened in WATCHDOG_TIMEOUT seconds.
+def watchdog_loop():
+    while True:
+        time.sleep(WATCHDOG_TIMEOUT / 2)
         with auto_lock:
             is_autonomous = autonomous
-
-        if not is_autonomous:
+        if is_autonomous and (time.monotonic() - last_inference_ts) > WATCHDOG_TIMEOUT:
+            print("WATCHDOG: inference stalled, stopping motors")
             stop_motors()
-        elif command == "recover":
-            turn_right(SPEED_RECOVER)   # pivot right until lane reappears
-        else:
-            {"forward": forward, "turn_left": turn_left, "turn_right": turn_right}[command](speed)
-
-        # --- Annotate frame for streaming ---
-        vis = overlay_mask(frame, pred_mask.astype(int))
-        display_cmd = "recover→right" if command == "recover" else command
-        display_spd = speed if is_autonomous else 0
-        auto_str    = "AUTO" if is_autonomous else "IDLE (press Enter)"
-        label = (f"{auto_str}  cmd:{display_cmd}  spd:{display_spd}"
-                 f"  lane px:{int(pred_mask.sum())}  conf:{max_conf:.2f}")
-        cv2.putText(vis, label, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        with annotated_lock:
-            annotated_frame = vis
-
-        time.sleep(0.1)   # ~10 Hz — reduces GPU/CPU load and battery drain
 
 
 # ── Flask: MJPEG stream ────────────────────────────────────────────────────────
@@ -377,13 +411,24 @@ def toggle():
 
 
 # ── Clean shutdown ─────────────────────────────────────────────────────────────
+_shutdown_started = False
+_shutdown_lock    = threading.Lock()
+
 def shutdown(sig, frame):
+    global _shutdown_started
+    with _shutdown_lock:
+        if _shutdown_started:
+            return
+        _shutdown_started = True
     print("\nShutting down …")
-    stop_motors()
-    pwm_left.stop()
-    pwm_right.stop()
-    GPIO.cleanup()
-    cap.release()
+    try:
+        stop_motors()
+        pwm_left.stop()
+        pwm_right.stop()
+        GPIO.cleanup()
+        cap.release()
+    except Exception as e:
+        print(f"shutdown error: {e}")
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, shutdown)
@@ -400,6 +445,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=capture_loop,   daemon=True).start()
     threading.Thread(target=inference_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop,  daemon=True).start()
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False),
                      daemon=True).start()
 
