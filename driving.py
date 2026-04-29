@@ -30,12 +30,12 @@ SPEED_LOST     = 15   # speed while coasting through a brief detection dropout
 # left_duty  = SPEED + STEER_GAIN * error
 # right_duty = SPEED - STEER_GAIN * error
 # Higher gain = sharper turns + more wobble. Tune on the car.
-STEER_GAIN          = 25
-ERROR_ALPHA         = 0.65   # EWMA on raw error: smaller = smoother but laggier
+STEER_GAIN          = 40
+ERROR_ALPHA         = 0.25   # EWMA on raw error: smaller = smoother but laggier
 LANE_WIDTH_DEFAULT  = 0.60   # initial lane width as a fraction of frame width
 LANE_WIDTH_ALPHA    = 0.85   # EWMA on lane-width estimate (slow update)
 BOUNDARY_MATCH_PX   = 120    # max horizontal jump for matching a blob to last frame's left/right boundary
-LOST_FRAMES_HOLD    = 15     # ~1.5s at 10Hz: hold last command this long before stopping
+LOST_FRAMES_HOLD    = 25     # ~2.5s at 10Hz: hold last command this long before stopping
 STRIP_TOP_FRAC      = 0.25   # ignore top N of frame (horizon); use rows [N*h, h] for blob search.
                              # Lower = more detection range; raise toward 0.5 if distant noise misleads steering.
 
