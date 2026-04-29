@@ -272,12 +272,30 @@ PAGE = """
            align-items:center; color:#eee; font-family:sans-serif; padding:12px; }
     img  { width:100%; max-width:800px; border-radius:6px; }
     p    { font-size:13px; color:#888; margin-top:8px; }
+    #btn { margin:14px 0; padding:16px 0; font-size:24px; font-weight:bold;
+           border:none; border-radius:10px; cursor:pointer; width:260px; }
+    #btn.idle    { background:#27ae60; color:#fff; }
+    #btn.running { background:#e74c3c; color:#fff; }
   </style>
 </head>
 <body>
-  <h2>RC Live Feed</h2>
+  <h2>RC Autonomous Drive</h2>
   <img src="/stream" alt="camera feed">
+  <button id="btn" class="idle">START</button>
   <p>Green overlay = detected lane &nbsp;|&nbsp; cmd shown top-left</p>
+<script>
+const btn = document.getElementById('btn');
+function refresh() {
+  fetch('/status').then(r => r.json()).then(d => {
+    btn.textContent = d.autonomous ? 'STOP' : 'START';
+    btn.className   = d.autonomous ? 'running' : 'idle';
+  });
+}
+btn.addEventListener('click', () =>
+  fetch('/toggle', {method:'POST'}).then(refresh)
+);
+setInterval(refresh, 1000);
+</script>
 </body>
 </html>
 """
@@ -326,6 +344,24 @@ def index():
 def stream():
     return Response(mjpeg_generator(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.route("/status")
+def status():
+    from flask import jsonify
+    with auto_lock:
+        state = autonomous
+    return jsonify(autonomous=state)
+
+@app.route("/toggle", methods=["POST"])
+def toggle():
+    from flask import jsonify
+    global autonomous
+    with auto_lock:
+        autonomous = not autonomous
+        state = autonomous
+    if not state:
+        stop_motors()
+    return jsonify(autonomous=state)
 
 
 # ── Clean shutdown ─────────────────────────────────────────────────────────────
