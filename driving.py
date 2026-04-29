@@ -32,6 +32,10 @@ SPEED_LOST     = 15   # speed while coasting through a brief detection dropout
 # Higher gain = sharper turns + more wobble. Tune on the car.
 STEER_GAIN          = 40
 ERROR_ALPHA         = 0.25   # EWMA on raw error: smaller = smoother but laggier
+TURN_SLOWDOWN       = 0.55   # at |err|=1, forward speed drops to SPEED * (1 - this).
+                             # Lets the car physically rotate through tight turns instead of overshooting.
+INSIDE_REVERSE_CAP  = 30     # max reverse PWM for the inside wheel during sharp turns
+                             # (negative = wheel briefly spins backward to tighten the pivot)
 LANE_WIDTH_DEFAULT  = 0.60   # initial lane width as a fraction of frame width
 LANE_WIDTH_ALPHA    = 0.85   # EWMA on lane-width estimate (slow update)
 BOUNDARY_MATCH_PX   = 120    # max horizontal jump for matching a blob to last frame's left/right boundary
@@ -359,10 +363,13 @@ def inference_loop():
                     left_duty = right_duty = 0
                 drive(left_duty, right_duty)
             else:
-                # Normal proportional control. Clamp to [0, 100] so we never
-                # auto-reverse a wheel — keeps motion smooth for the demo.
-                left_duty  = max(0, min(100, SPEED + STEER_GAIN * error))
-                right_duty = max(0, min(100, SPEED - STEER_GAIN * error))
+                # Slow the forward speed proportional to |error| so the car has
+                # time to actually rotate through the turn. Inside wheel may
+                # briefly reverse on hard turns to tighten the pivot radius.
+                slow_factor = 1.0 - TURN_SLOWDOWN * abs(error)
+                base = SPEED * slow_factor
+                left_duty  = max(-INSIDE_REVERSE_CAP, min(100, base + STEER_GAIN * error))
+                right_duty = max(-INSIDE_REVERSE_CAP, min(100, base - STEER_GAIN * error))
                 drive(left_duty, right_duty)
 
             # --- Annotate frame for streaming ---
