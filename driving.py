@@ -38,6 +38,11 @@ INSIDE_REVERSE_CAP  = 30     # max reverse PWM for the inside wheel during sharp
                              # (negative = wheel briefly spins backward to tighten the pivot)
 LANE_WIDTH_DEFAULT  = 0.60   # initial lane width as a fraction of frame width
 LANE_WIDTH_ALPHA    = 0.85   # EWMA on lane-width estimate (slow update)
+SIDE_FLIP_PX        = 80     # in single-blob mode, the locked side flips only after the
+                             # blob has crossed this far past camera center (hysteresis).
+                             # Prevents both oscillation when blob is near center AND wrong
+                             # locks during turns where the visible boundary genuinely moves
+                             # across the frame.
 LOST_FRAMES_HOLD    = 25     # ~2.5s at 10Hz: hold last command this long before stopping
 STRIP_TOP_FRAC      = 0.25   # ignore top N of frame (horizon); use rows [N*h, h] for blob search.
                              # Lower = more detection range; raise toward 0.5 if distant noise misleads steering.
@@ -301,24 +306,32 @@ def decide_steering(mask):
         regime = "two"
         _locked_side = None   # both visible — release any single-blob lock
 
-    # ── Regime: one blob — sticky identity from the last 2-blob frame ────────
+    # ── Regime: one blob — sticky-with-hysteresis identity ───────────────────
     else:
         cx = blobs_sorted[0][0]
+        center = w / 2
 
-        # Decide identity once, then lock it until both boundaries reappear.
-        # This prevents the dangerous "blob crossed center → re-identified as
-        # the wrong side" case during a turn.
+        # Initial lock: prefer proximity to last 2-blob frame, fall back to
+        # which half of the frame the blob is in.
         if _locked_side is None:
             d_left  = abs(cx - _prev_left_x)  if _prev_left_x  is not None else float("inf")
             d_right = abs(cx - _prev_right_x) if _prev_right_x is not None else float("inf")
             if d_left == float("inf") and d_right == float("inf"):
-                _locked_side = "left" if cx < w / 2 else "right"
+                _locked_side = "left" if cx < center else "right"
             elif d_left == float("inf"):
                 _locked_side = "right"
             elif d_right == float("inf"):
                 _locked_side = "left"
             else:
                 _locked_side = "left" if d_left <= d_right else "right"
+        else:
+            # Already locked. Allow it to flip only when the blob has clearly
+            # crossed past camera center to the other side (SIDE_FLIP_PX of
+            # hysteresis prevents flapping when the blob hovers near center).
+            if _locked_side == "left" and cx > center + SIDE_FLIP_PX:
+                _locked_side = "right"
+            elif _locked_side == "right" and cx < center - SIDE_FLIP_PX:
+                _locked_side = "left"
 
         if _locked_side == "left":
             _prev_left_x = cx
