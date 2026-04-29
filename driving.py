@@ -218,6 +218,8 @@ _prev_right_x  = None    # last known x of right boundary (in mask coords)
 _lane_width_px = None    # running estimate of lane width in pixels (mask coords)
 _error_ewma    = 0.0     # smoothed steering error in [-1, +1]
 _lost_count    = 0       # consecutive frames with no usable detection
+_locked_side   = None    # "left"|"right"|None — sticky identity for single-blob mode;
+                         # set on first single-blob frame, cleared when both blobs reappear
 
 
 def decide_steering(mask):
@@ -227,7 +229,7 @@ def decide_steering(mask):
       regime ∈ {"two", "one_left", "one_right", "lost"}
       debug  — dict for the on-screen overlay (lane_x, left_x, right_x, lane_width)
     """
-    global _prev_left_x, _prev_right_x, _lane_width_px, _error_ewma, _lost_count
+    global _prev_left_x, _prev_right_x, _lane_width_px, _error_ewma, _lost_count, _locked_side
 
     mask_u8 = mask.astype(np.uint8)
     h, w = mask_u8.shape
@@ -274,26 +276,28 @@ def decide_steering(mask):
         _prev_left_x, _prev_right_x = left_x, right_x
         lane_x = (left_x + right_x) / 2
         regime = "two"
+        _locked_side = None   # both visible — release any single-blob lock
 
-    # ── Regime: one blob — assign to a side using history ─────────────────────
+    # ── Regime: one blob — sticky identity from the last 2-blob frame ────────
     else:
         cx = blobs_sorted[0][0]
 
-        # Distance to last known left/right; pick the closer match.
-        d_left  = abs(cx - _prev_left_x)  if _prev_left_x  is not None else float("inf")
-        d_right = abs(cx - _prev_right_x) if _prev_right_x is not None else float("inf")
+        # Decide identity once, then lock it until both boundaries reappear.
+        # This prevents the dangerous "blob crossed center → re-identified as
+        # the wrong side" case during a turn.
+        if _locked_side is None:
+            d_left  = abs(cx - _prev_left_x)  if _prev_left_x  is not None else float("inf")
+            d_right = abs(cx - _prev_right_x) if _prev_right_x is not None else float("inf")
+            if d_left == float("inf") and d_right == float("inf"):
+                _locked_side = "left" if cx < w / 2 else "right"
+            elif d_left == float("inf"):
+                _locked_side = "right"
+            elif d_right == float("inf"):
+                _locked_side = "left"
+            else:
+                _locked_side = "left" if d_left <= d_right else "right"
 
-        if d_left == float("inf") and d_right == float("inf"):
-            # No history yet — fall back to "left half = left boundary"
-            is_left = cx < w / 2
-        elif d_left <= BOUNDARY_MATCH_PX or d_right <= BOUNDARY_MATCH_PX:
-            is_left = d_left <= d_right
-        else:
-            # Neither last position matches → blob jumped. Treat as the side
-            # we last saw anchored. If we have both, pick by raw position.
-            is_left = cx < w / 2
-
-        if is_left:
+        if _locked_side == "left":
             _prev_left_x = cx
             lane_x = cx + _lane_width_px / 2
             regime = "one_left"
