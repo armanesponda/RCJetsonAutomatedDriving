@@ -36,6 +36,8 @@ LANE_WIDTH_DEFAULT  = 0.60   # initial lane width as a fraction of frame width
 LANE_WIDTH_ALPHA    = 0.85   # EWMA on lane-width estimate (slow update)
 BOUNDARY_MATCH_PX   = 120    # max horizontal jump for matching a blob to last frame's left/right boundary
 LOST_FRAMES_HOLD    = 15     # ~1.5s at 10Hz: hold last command this long before stopping
+STRIP_TOP_FRAC      = 0.25   # ignore top N of frame (horizon); use rows [N*h, h] for blob search.
+                             # Lower = more detection range; raise toward 0.5 if distant noise misleads steering.
 
 # ── Pin definitions (BCM numbering) ────────────────────────────────────────────
 ENA = 17   # Left motor PWM   (board pin 11)
@@ -232,8 +234,10 @@ def decide_steering(mask):
     if _lane_width_px is None:
         _lane_width_px = LANE_WIDTH_DEFAULT * w
 
-    # Closest-to-car strip. Bottom third is fine; bigger strip = more context.
-    bottom = mask_u8[h * 2 // 3:, :]
+    # Search strip: skip the top horizon area; everything below is fair game.
+    # Camera is tilted down hard enough that "near tape" actually appears in the
+    # middle of the frame, not the bottom.
+    bottom = mask_u8[int(h * STRIP_TOP_FRAC):, :]
 
     # Light morphological open to suppress speckle before connected components.
     kernel = np.ones((3, 3), np.uint8)
