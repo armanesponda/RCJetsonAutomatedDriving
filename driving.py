@@ -340,6 +340,7 @@ def shutdown(sig, frame):
 
 signal.signal(signal.SIGTERM, shutdown)
 signal.signal(signal.SIGHUP,  shutdown)
+signal.signal(signal.SIGINT,  shutdown)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -349,12 +350,10 @@ if __name__ == "__main__":
     model.eval()
     print("Model ready.")
 
-    threading.Thread(target=keyboard_listener, daemon=True).start()
     threading.Thread(target=capture_loop,   daemon=True).start()
     threading.Thread(target=inference_loop, daemon=True).start()
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False),
+                     daemon=True).start()
 
     print(f"Open http://<jetson-ip>:{PORT} in your browser")
-    try:
-        app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False)
-    finally:
-        shutdown(None, None)
+    keyboard_listener()   # runs on main thread — stdin works correctly
