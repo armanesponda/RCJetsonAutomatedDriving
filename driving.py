@@ -184,11 +184,14 @@ def overlay_mask(frame, mask):
 def decide_steering(mask):
     """Returns (command, speed). 'recover' means no lane visible — turn right to search."""
     mask_u8 = mask.astype(np.uint8)
-    _, w = mask_u8.shape
-    num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(mask_u8)
+    h, w = mask_u8.shape
 
+    # Only use the bottom third — closest tape to the car
+    bottom = mask_u8[h * 2 // 3:, :]
+
+    num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(bottom)
     blobs = [
-        (centroids[i], stats[i, cv2.CC_STAT_AREA])
+        (centroids[i][0], stats[i, cv2.CC_STAT_AREA])
         for i in range(1, num_labels)
         if stats[i, cv2.CC_STAT_AREA] >= MIN_BLOB_AREA
     ]
@@ -196,8 +199,17 @@ def decide_steering(mask):
     if len(blobs) == 0:
         return "recover", SPEED_RECOVER
 
-    cx = max(blobs, key=lambda b: b[1])[0][0]
-    error = (cx - w / 2) / (w / 2)
+    if len(blobs) == 1:
+        # Only one boundary visible — steer away from it
+        cx = blobs[0][0]
+        return ("turn_right" if cx < w / 2 else "turn_left"), SPEED_TURN
+
+    # Two or more blobs — find leftmost and rightmost boundary centroids
+    blobs_sorted = sorted(blobs, key=lambda b: b[0])
+    cx_mid = (blobs_sorted[0][0] + blobs_sorted[-1][0]) / 2
+
+    # Steer toward the midpoint (lane center)
+    error = (cx_mid - w / 2) / (w / 2)
 
     if abs(error) < STEER_DEADBAND:
         return "forward", SPEED
