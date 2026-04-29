@@ -22,9 +22,20 @@ DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "best_model.pth"
 INPUT_SIZE = (640, 360)   # width, height fed to the model
 PORT       = 5000
-SPEED          = 50   # straight speed (0–100)
-SPEED_TURN     = 35   # speed while turning
-SPEED_RECOVER  = 30   # speed while searching for lane (no blobs)
+SPEED          = 50   # base forward duty cycle (0–100); both wheels at this on a perfect straight
+SPEED_LOST     = 25   # speed while coasting through a brief detection dropout
+
+# ── Steering controller knobs ─────────────────────────────────────────────────
+# error ∈ [-1, +1]: -1 = lane center is at far left of frame, +1 = far right.
+# left_duty  = SPEED + STEER_GAIN * error
+# right_duty = SPEED - STEER_GAIN * error
+# Higher gain = sharper turns + more wobble. Tune on the car.
+STEER_GAIN          = 35
+ERROR_ALPHA         = 0.65   # EWMA on raw error: smaller = smoother but laggier
+LANE_WIDTH_DEFAULT  = 0.60   # initial lane width as a fraction of frame width
+LANE_WIDTH_ALPHA    = 0.85   # EWMA on lane-width estimate (slow update)
+BOUNDARY_MATCH_PX   = 120    # max horizontal jump for matching a blob to last frame's left/right boundary
+LOST_FRAMES_HOLD    = 15     # ~1.5s at 10Hz: hold last command this long before stopping
 
 # ── Pin definitions (BCM numbering) ────────────────────────────────────────────
 ENA = 17   # Left motor PWM   (board pin 11)
@@ -35,7 +46,6 @@ IN3 = 16   # Right forward    (board pin 36)
 IN4 = 20   # Right backward   (board pin 38)
 
 MIN_BLOB_AREA = 200 #for smaller blobs that are noise
-STEER_DEADBAND = 0.10 #10% of the frame width counts as centered
 
 
 # ── SoftPWM ────────────────────────────────────────────────────────────────────
@@ -91,37 +101,40 @@ pwm_right.start(0)
 
 
 # ── Motor commands ─────────────────────────────────────────────────────────────
+# drive() is the primitive: each side takes a signed duty cycle in [-100, 100].
+# Positive = forward, negative = backward. Everything else is a wrapper.
+def drive(left, right):
+    left  = max(-100, min(100, left))
+    right = max(-100, min(100, right))
+    if left >= 0:
+        GPIO.output(IN1, GPIO.HIGH); GPIO.output(IN2, GPIO.LOW)
+    else:
+        GPIO.output(IN1, GPIO.LOW);  GPIO.output(IN2, GPIO.HIGH)
+    if right >= 0:
+        GPIO.output(IN3, GPIO.HIGH); GPIO.output(IN4, GPIO.LOW)
+    else:
+        GPIO.output(IN3, GPIO.LOW);  GPIO.output(IN4, GPIO.HIGH)
+    pwm_left.ChangeDutyCycle(abs(left))
+    pwm_right.ChangeDutyCycle(abs(right))
+
 def stop_motors():
-    GPIO.output(IN1, GPIO.LOW);  GPIO.output(IN2, GPIO.LOW)
-    GPIO.output(IN3, GPIO.LOW);  GPIO.output(IN4, GPIO.LOW)
-    pwm_left.ChangeDutyCycle(0)
-    pwm_right.ChangeDutyCycle(0)
+    drive(0, 0)
+    GPIO.output(IN1, GPIO.LOW); GPIO.output(IN2, GPIO.LOW)
+    GPIO.output(IN3, GPIO.LOW); GPIO.output(IN4, GPIO.LOW)
 
 def forward(speed=SPEED):
-    GPIO.output(IN1, GPIO.HIGH); GPIO.output(IN2, GPIO.LOW)
-    GPIO.output(IN3, GPIO.HIGH); GPIO.output(IN4, GPIO.LOW)
-    pwm_left.ChangeDutyCycle(speed)
-    pwm_right.ChangeDutyCycle(speed)
+    drive(speed, speed)
 
 def backward(speed=SPEED):
-    GPIO.output(IN1, GPIO.LOW);  GPIO.output(IN2, GPIO.HIGH)
-    GPIO.output(IN3, GPIO.LOW);  GPIO.output(IN4, GPIO.HIGH)
-    pwm_left.ChangeDutyCycle(speed)
-    pwm_right.ChangeDutyCycle(speed)
+    drive(-speed, -speed)
 
+# Pivot helpers — kept for manual testing only; the autonomous loop uses drive()
+# directly via differential speed control.
 def turn_left(speed=SPEED):
-    # Left wheel reverses while right wheel goes forward → pivot left
-    GPIO.output(IN1, GPIO.LOW);  GPIO.output(IN2, GPIO.HIGH)
-    GPIO.output(IN3, GPIO.HIGH); GPIO.output(IN4, GPIO.LOW)
-    pwm_left.ChangeDutyCycle(speed)
-    pwm_right.ChangeDutyCycle(speed)
+    drive(-speed, speed)
 
 def turn_right(speed=SPEED):
-    # Right wheel reverses while left wheel goes forward → pivot right
-    GPIO.output(IN1, GPIO.HIGH); GPIO.output(IN2, GPIO.LOW)
-    GPIO.output(IN3, GPIO.LOW);  GPIO.output(IN4, GPIO.HIGH)
-    pwm_left.ChangeDutyCycle(speed)
-    pwm_right.ChangeDutyCycle(speed)
+    drive(speed, -speed)
 
 
 # ── Camera ─────────────────────────────────────────────────────────────────────
@@ -195,42 +208,106 @@ def overlay_mask(frame, mask):
     return cv2.addWeighted(frame, 0.7, green_layer, 0.3, 0)
 
 
+# ── Steering controller state ─────────────────────────────────────────────────
+# Persisted across frames so we can track which boundary is which when only one
+# is visible, smooth the error signal, and hold last command through dropouts.
+_prev_left_x   = None    # last known x of left  boundary (in mask coords)
+_prev_right_x  = None    # last known x of right boundary (in mask coords)
+_lane_width_px = None    # running estimate of lane width in pixels (mask coords)
+_error_ewma    = 0.0     # smoothed steering error in [-1, +1]
+_lost_count    = 0       # consecutive frames with no usable detection
+
+
 def decide_steering(mask):
-    """Returns (command, speed). 'recover' means no lane visible — turn right to search."""
+    """
+    Returns (error, regime, debug).
+      error  ∈ [-1, +1]   — smoothed; >0 means lane center is right of camera center
+      regime ∈ {"two", "one_left", "one_right", "lost"}
+      debug  — dict for the on-screen overlay (lane_x, left_x, right_x, lane_width)
+    """
+    global _prev_left_x, _prev_right_x, _lane_width_px, _error_ewma, _lost_count
+
     mask_u8 = mask.astype(np.uint8)
     h, w = mask_u8.shape
+    if _lane_width_px is None:
+        _lane_width_px = LANE_WIDTH_DEFAULT * w
 
-    # Only use the bottom third — closest tape to the car
+    # Closest-to-car strip. Bottom third is fine; bigger strip = more context.
     bottom = mask_u8[h * 2 // 3:, :]
+
+    # Light morphological open to suppress speckle before connected components.
+    kernel = np.ones((3, 3), np.uint8)
+    bottom = cv2.morphologyEx(bottom, cv2.MORPH_OPEN, kernel)
 
     num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(bottom)
     blobs = [
-        (centroids[i][0], stats[i, cv2.CC_STAT_AREA])
+        (float(centroids[i][0]), int(stats[i, cv2.CC_STAT_AREA]))
         for i in range(1, num_labels)
         if stats[i, cv2.CC_STAT_AREA] >= MIN_BLOB_AREA
     ]
 
-    if len(blobs) == 0:
-        return "recover", SPEED_RECOVER
+    debug = {"left_x": None, "right_x": None, "lane_x": None,
+             "lane_width": _lane_width_px, "n_blobs": len(blobs)}
 
-    if len(blobs) == 1:
-        # Only one boundary visible — steer away from it
-        cx = blobs[0][0]
-        return ("turn_right" if cx < w / 2 else "turn_left"), SPEED_TURN
+    # ── Regime: lost ──────────────────────────────────────────────────────────
+    if not blobs:
+        _lost_count += 1
+        return _error_ewma, "lost", debug
 
-    # Two or more blobs — find leftmost and rightmost boundary centroids
+    _lost_count = 0
     blobs_sorted = sorted(blobs, key=lambda b: b[0])
-    cx_mid = (blobs_sorted[0][0] + blobs_sorted[-1][0]) / 2
 
-    # Steer toward the midpoint (lane center)
-    error = (cx_mid - w / 2) / (w / 2)
+    # ── Regime: two or more blobs — use outermost as the two boundaries ──────
+    if len(blobs_sorted) >= 2:
+        left_x  = blobs_sorted[0][0]
+        right_x = blobs_sorted[-1][0]
+        observed_width = right_x - left_x
+        # Only update lane width from sane observations (avoid degenerate
+        # near-zero widths from two blobs of the same boundary fragmented).
+        if observed_width > 0.2 * w:
+            _lane_width_px = (LANE_WIDTH_ALPHA * _lane_width_px
+                              + (1 - LANE_WIDTH_ALPHA) * observed_width)
+        _prev_left_x, _prev_right_x = left_x, right_x
+        lane_x = (left_x + right_x) / 2
+        regime = "two"
 
-    if abs(error) < STEER_DEADBAND:
-        return "forward", SPEED
-    elif error < 0:
-        return "turn_left", SPEED_TURN
+    # ── Regime: one blob — assign to a side using history ─────────────────────
     else:
-        return "turn_right", SPEED_TURN
+        cx = blobs_sorted[0][0]
+
+        # Distance to last known left/right; pick the closer match.
+        d_left  = abs(cx - _prev_left_x)  if _prev_left_x  is not None else float("inf")
+        d_right = abs(cx - _prev_right_x) if _prev_right_x is not None else float("inf")
+
+        if d_left == float("inf") and d_right == float("inf"):
+            # No history yet — fall back to "left half = left boundary"
+            is_left = cx < w / 2
+        elif d_left <= BOUNDARY_MATCH_PX or d_right <= BOUNDARY_MATCH_PX:
+            is_left = d_left <= d_right
+        else:
+            # Neither last position matches → blob jumped. Treat as the side
+            # we last saw anchored. If we have both, pick by raw position.
+            is_left = cx < w / 2
+
+        if is_left:
+            _prev_left_x = cx
+            lane_x = cx + _lane_width_px / 2
+            regime = "one_left"
+        else:
+            _prev_right_x = cx
+            lane_x = cx - _lane_width_px / 2
+            regime = "one_right"
+
+    # ── Convert to error and smooth ────────────────────────────────────────────
+    raw_error = (lane_x - w / 2) / (w / 2)
+    raw_error = max(-1.0, min(1.0, raw_error))
+    _error_ewma = ERROR_ALPHA * _error_ewma + (1 - ERROR_ALPHA) * raw_error
+
+    debug["lane_x"]   = lane_x
+    debug["left_x"]   = _prev_left_x
+    debug["right_x"]  = _prev_right_x
+    debug["lane_width"] = _lane_width_px
+    return _error_ewma, regime, debug
 
 # ── Thread 2: inference + motor control ────────────────────────────────────────
 # Reads the latest camera frame, runs the segmentation model, decides a steering
@@ -257,27 +334,47 @@ def inference_loop():
             pred_mask = (lane_prob.cpu().numpy() > 0.25)   # boolean [H, W]
 
             # --- Motor control ---
-            command, speed = decide_steering(pred_mask)
+            error, regime, dbg = decide_steering(pred_mask)
 
             with auto_lock:
                 is_autonomous = autonomous
 
             if not is_autonomous:
+                left_duty = right_duty = 0
                 stop_motors()
-            elif command == "recover":
-                turn_right(SPEED_RECOVER)   # pivot right until lane reappears
+            elif regime == "lost":
+                # Hold last command at reduced speed for a short window, then stop.
+                if _lost_count <= LOST_FRAMES_HOLD:
+                    left_duty  = max(0, min(100, SPEED_LOST + STEER_GAIN * error))
+                    right_duty = max(0, min(100, SPEED_LOST - STEER_GAIN * error))
+                else:
+                    left_duty = right_duty = 0
+                drive(left_duty, right_duty)
             else:
-                {"forward": forward, "turn_left": turn_left, "turn_right": turn_right}[command](speed)
+                # Normal proportional control. Clamp to [0, 100] so we never
+                # auto-reverse a wheel — keeps motion smooth for the demo.
+                left_duty  = max(0, min(100, SPEED + STEER_GAIN * error))
+                right_duty = max(0, min(100, SPEED - STEER_GAIN * error))
+                drive(left_duty, right_duty)
 
             # --- Annotate frame for streaming ---
             vis = overlay_mask(frame, pred_mask.astype(int))
-            display_cmd = "recover→right" if command == "recover" else command
-            display_spd = speed if is_autonomous else 0
-            auto_str    = "AUTO" if is_autonomous else "IDLE (press Enter)"
-            label = (f"{auto_str}  cmd:{display_cmd}  spd:{display_spd}"
-                     f"  lane px:{int(pred_mask.sum())}  conf:{max_conf:.2f}")
-            cv2.putText(vis, label, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # Draw lane center marker if available (in mask coords → frame coords)
+            if dbg["lane_x"] is not None:
+                fx = int(dbg["lane_x"] * frame.shape[1] / pred_mask.shape[1])
+                fy = int(frame.shape[0] * 5 / 6)
+                cv2.circle(vis, (fx, fy), 8, (0, 255, 255), -1)
+                cv2.line(vis, (frame.shape[1] // 2, fy - 20),
+                              (frame.shape[1] // 2, fy + 20), (255, 255, 255), 1)
+            auto_str  = "AUTO" if is_autonomous else "IDLE (press Enter)"
+            label1 = (f"{auto_str}  regime:{regime}  err:{error:+.2f}"
+                      f"  L:{int(left_duty)} R:{int(right_duty)}")
+            label2 = (f"blobs:{dbg['n_blobs']}  lane_w:{int(dbg['lane_width'])}"
+                      f"  lost:{_lost_count}  conf:{max_conf:.2f}")
+            cv2.putText(vis, label1, (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(vis, label2, (10, 52),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
             with annotated_lock:
                 annotated_frame = vis
