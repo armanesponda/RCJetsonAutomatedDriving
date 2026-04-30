@@ -1,6 +1,7 @@
 import os
 os.environ['JETSON_MODEL'] = 'JETSON_ORIN_NANO'
 
+import atexit
 import signal
 import sys
 import threading
@@ -47,8 +48,7 @@ SIDE_FLIP_PX        = 80     # in single-blob mode, the locked side flips only a
                              # locks during turns where the visible boundary genuinely moves
                              # across the frame.
 LOST_FRAMES_HOLD    = 25     # ~2.5s at 10Hz: hold last command this long before stopping
-STRIP_TOP_FRAC      = 0.25   # ignore top N of frame (horizon); use rows [N*h, h] for blob search.
-                             # Lower = more detection range; raise toward 0.5 if distant noise misleads steering.
+STRIP_TOP_FRAC      = 0.50   # ignore top half of frame; only react to tape that is close to the car.
 
 # ── Pin definitions (BCM numbering) ────────────────────────────────────────────
 ENA = 17   # Left motor PWM   (board pin 11)
@@ -504,7 +504,12 @@ def keyboard_listener():
     global autonomous
     print("Controls: Enter = start/stop autonomous mode | q+Enter = quit")
     while True:
-        key = input().strip().lower()
+        try:
+            key = input().strip().lower()
+        except EOFError:
+            # SSH disconnected or stdin closed — clean up properly
+            shutdown(None, None)
+            return
         if key == 'q':
             shutdown(None, None)
         else:
@@ -591,6 +596,7 @@ def shutdown(sig, frame):
 signal.signal(signal.SIGTERM, shutdown)
 signal.signal(signal.SIGHUP,  shutdown)
 signal.signal(signal.SIGINT,  shutdown)
+atexit.register(lambda: GPIO.cleanup())
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -608,4 +614,5 @@ if __name__ == "__main__":
 
     print(f"Open http://<jetson-ip>:{PORT} in your browser")
     keyboard_listener()   # runs on main thread — stdin works correctly
+
 
