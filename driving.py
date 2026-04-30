@@ -23,7 +23,9 @@ MODEL_PATH = "best_model.pth"
 INPUT_SIZE = (640, 360)   # width, height fed to the model
 PORT       = 5000
 SPEED          = 30   # base forward duty cycle (0–100); both wheels at this on a perfect straight
+SPEED_ONE_BLOB = 20   # reduced base speed when only one boundary is visible (mid-turn)
 SPEED_LOST     = 15   # speed while coasting through a brief detection dropout
+BARRIER_SPEED  = 25   # pivot speed when a horizontal barrier is detected
 
 # ── Steering controller knobs ─────────────────────────────────────────────────
 # error ∈ [-1, +1]: -1 = lane center is at far left of frame, +1 = far right.
@@ -34,8 +36,9 @@ STEER_GAIN          = 40
 ERROR_ALPHA         = 0.25   # EWMA on raw error: smaller = smoother but laggier
 TURN_SLOWDOWN       = 0.55   # at |err|=1, forward speed drops to SPEED * (1 - this).
                              # Lets the car physically rotate through tight turns instead of overshooting.
-INSIDE_REVERSE_CAP  = 30     # max reverse PWM for the inside wheel during sharp turns
-                             # (negative = wheel briefly spins backward to tighten the pivot)
+INSIDE_REVERSE_CAP  = 0      # disabled — inside wheel only slows, never reverses.
+                             # Re-enable (e.g. 20) only if turns are too wide after barrier detection works.
+BARRIER_WIDTH_FRAC  = 0.75   # if two-blob span > this fraction of frame width → horizontal barrier, not lane
 LANE_WIDTH_DEFAULT  = 0.60   # initial lane width as a fraction of frame width
 LANE_WIDTH_ALPHA    = 0.85   # EWMA on lane-width estimate (slow update)
 SIDE_FLIP_PX        = 80     # in single-blob mode, the locked side flips only after the
@@ -59,9 +62,6 @@ MIN_BLOB_AREA = 200 #for smaller blobs that are noise
 
 
 # ── SoftPWM ────────────────────────────────────────────────────────────────────
-# The Jetson Orin Nano does not expose hardware PWM on the same pins as a
-# Raspberry Pi, so we replicate it in software: a background thread toggles
-# the enable pin at the requested duty cycle.
 class SoftPWM:
     def __init__(self, pin, freq=100):
         self.pin    = pin
@@ -296,6 +296,13 @@ def decide_steering(mask):
         left_x  = blobs_sorted[0][0]
         right_x = blobs_sorted[-1][0]
         observed_width = right_x - left_x
+
+        # A horizontal barrier (90° corner tape) spans most of the frame width.
+        # Two lane boundaries never do — the lane is always narrower than the frame.
+        if observed_width > BARRIER_WIDTH_FRAC * w:
+            debug["lane_x"] = w / 2
+            return 0.0, "barrier", debug
+
         # Only update lane width from sane observations (avoid degenerate
         # near-zero widths from two blobs of the same boundary fragmented).
         if observed_width > 0.2 * w:
@@ -386,6 +393,10 @@ def inference_loop():
             if not is_autonomous:
                 left_duty = right_duty = 0
                 stop_motors()
+            elif regime == "barrier":
+                # Horizontal tape across frame — 90° corner. Pivot right until clear.
+                left_duty, right_duty = BARRIER_SPEED, -BARRIER_SPEED
+                drive(left_duty, right_duty)
             elif regime == "lost":
                 # Hold last command at reduced speed for a short window, then stop.
                 if _lost_count <= LOST_FRAMES_HOLD:
@@ -395,11 +406,10 @@ def inference_loop():
                     left_duty = right_duty = 0
                 drive(left_duty, right_duty)
             else:
-                # Slow the forward speed proportional to |error| so the car has
-                # time to actually rotate through the turn. Inside wheel may
-                # briefly reverse on hard turns to tighten the pivot radius.
+                # Single-blob regime: slow down — car is mid-turn with one boundary hidden.
+                base_speed = SPEED_ONE_BLOB if regime in ("one_left", "one_right") else SPEED
                 slow_factor = 1.0 - TURN_SLOWDOWN * abs(error)
-                base = SPEED * slow_factor
+                base = base_speed * slow_factor
                 left_duty  = max(-INSIDE_REVERSE_CAP, min(100, base + STEER_GAIN * error))
                 right_duty = max(-INSIDE_REVERSE_CAP, min(100, base - STEER_GAIN * error))
                 drive(left_duty, right_duty)
@@ -413,7 +423,7 @@ def inference_loop():
                 cv2.circle(vis, (fx, fy), 8, (0, 255, 255), -1)
                 cv2.line(vis, (frame.shape[1] // 2, fy - 20),
                               (frame.shape[1] // 2, fy + 20), (255, 255, 255), 1)
-            auto_str  = "AUTO" if is_autonomous else "IDLE (press Enter)"
+            auto_str  = "AUTO" if is_autonomous else "IDLE"
             label1 = (f"{auto_str}  regime:{regime}  err:{error:+.2f}"
                       f"  L:{int(left_duty)} R:{int(right_duty)}")
             label2 = (f"blobs:{dbg['n_blobs']}  lane_w:{int(dbg['lane_width'])}"
@@ -598,3 +608,4 @@ if __name__ == "__main__":
 
     print(f"Open http://<jetson-ip>:{PORT} in your browser")
     keyboard_listener()   # runs on main thread — stdin works correctly
+
