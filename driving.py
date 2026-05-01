@@ -34,6 +34,9 @@ BARRIER_STRIP_TOP_FRAC = 0.30  # barrier detection scans a wider strip than lane
                                # close enough to enter the lane-extraction strip.
 BARRIER_COL_MIN_PX     = 3     # a column "counts" as filled if at least this many strip rows
                                # are tape. Filters speckle without rejecting thin bars.
+BARRIER_ENTRY_ERR_DEADBAND = 0.05  # |_error_ewma| below this at barrier entry → fall back to
+                                   # pixel-count heuristic for direction. Above → latch the
+                                   # EWMA sign as the pivot direction.
 
 # ── Steering controller knobs ─────────────────────────────────────────────────
 # error ∈ [-1, +1]: -1 = lane center is at far left of frame, +1 = far right.
@@ -240,6 +243,11 @@ _barrier_turning    = False   # True while executing a barrier pivot manoeuvre
 _barrier_direction  = None   # "left"|"right" — which way to pivot during barrier
 _barrier_flip_count = 0      # how many direction flips in the current barrier event
 _barrier_turn_start = 0.0    # monotonic time when the current pivot direction started
+_barrier_entry_error = 0.0   # _error_ewma latched at the moment barrier mode was entered;
+                             # primary signal for picking pivot direction (sign of error =
+                             # which way the lane was already curving).
+_barrier_dir_source = None   # "ewma"|"fallback" — which signal picked the direction this
+                             # event. Diagnostic only.
 
 
 def reset_steering_state():
@@ -248,15 +256,18 @@ def reset_steering_state():
     property and a good estimate from the previous run beats the default."""
     global _prev_left_x, _prev_right_x, _error_ewma, _lost_count, _locked_side
     global _barrier_turning, _barrier_direction, _barrier_flip_count, _barrier_turn_start
-    _prev_left_x        = None
-    _prev_right_x       = None
-    _error_ewma         = 0.0
-    _lost_count         = 0
-    _locked_side        = None
-    _barrier_turning    = False
-    _barrier_direction  = None
-    _barrier_flip_count = 0
-    _barrier_turn_start = 0.0
+    global _barrier_entry_error, _barrier_dir_source
+    _prev_left_x         = None
+    _prev_right_x        = None
+    _error_ewma          = 0.0
+    _lost_count          = 0
+    _locked_side         = None
+    _barrier_turning     = False
+    _barrier_direction   = None
+    _barrier_flip_count  = 0
+    _barrier_turn_start  = 0.0
+    _barrier_entry_error = 0.0
+    _barrier_dir_source  = None
 
 
 def decide_steering(mask):
@@ -319,11 +330,13 @@ def decide_steering(mask):
     filled_cols   = int((col_counts >= BARRIER_COL_MIN_PX).sum())
     debug["filled_cols"] = filled_cols
     if filled_cols > BARRIER_WIDTH_FRAC * w:
-        # Pixel-count direction picker (kept for now; commit 2 inverts it and
-        # adds the EWMA latch as the primary signal).
+        # Fallback direction heuristic: pivot toward the DENSER half. On a
+        # single-lane road, the inside-of-turn edge bunches up dense pixels on
+        # the side the lane continues. Used only when |_error_ewma| at entry
+        # is below the deadband (see inference_loop entry branch).
         left_px  = int(barrier_strip[:, :w // 2].sum())
         right_px = int(barrier_strip[:, w // 2:].sum())
-        debug["barrier_dir"] = "right" if right_px <= left_px else "left"
+        debug["barrier_dir"] = "right" if right_px >= left_px else "left"
         debug["lane_x"] = w / 2
         return _error_ewma, "barrier", debug
 
@@ -399,6 +412,7 @@ def decide_steering(mask):
 def inference_loop():
     global annotated_frame, last_inference_ts
     global _barrier_turning, _barrier_direction, _barrier_flip_count, _barrier_turn_start
+    global _barrier_entry_error, _barrier_dir_source
     while True:
         try:
             # Grab the most recent frame (non-blocking — skip if nothing new yet)
@@ -463,8 +477,18 @@ def inference_loop():
                         left_duty, right_duty = -BARRIER_SPEED, BARRIER_SPEED
                     drive(left_duty, right_duty)
             elif regime == "barrier":
-                _barrier_turning    = True
-                _barrier_direction  = dbg.get("barrier_dir") or "right"
+                _barrier_turning     = True
+                _barrier_entry_error = error
+                # Primary signal: sign of pre-barrier _error_ewma. The lane curves
+                # into the corner before the barrier becomes classifiable, so the
+                # controller is already steering into the turn.
+                if abs(_barrier_entry_error) >= BARRIER_ENTRY_ERR_DEADBAND:
+                    _barrier_direction  = "left" if _barrier_entry_error < 0 else "right"
+                    _barrier_dir_source = "ewma"
+                else:
+                    # Going effectively straight at entry — fall back to denser-side heuristic.
+                    _barrier_direction  = dbg.get("barrier_dir") or "right"
+                    _barrier_dir_source = "fallback"
                 _barrier_flip_count = 0
                 _barrier_turn_start = time.monotonic()
                 if _barrier_direction == "right":
