@@ -35,14 +35,16 @@ BARRIER_MAX_FLIPS    = 3     # give up (stop) after this many flips with no prog
 # left_duty  = SPEED + STEER_GAIN * error
 # right_duty = SPEED - STEER_GAIN * error
 # Higher gain = sharper turns + more wobble. Tune on the car.
-STEER_GAIN          = 50   # one-blob regime (mid-turn, one boundary visible) — sharper
-STEER_GAIN_TWO      = 35   # two-blob regime (both boundaries visible) — gentle correction
+STEER_GAIN            = 50   # one-blob starting gain; ramps up the longer the car stays in one-blob
+STEER_GAIN_MAX        = 70   # one-blob gain cap after STEER_GAIN_RAMP_FRAMES consecutive frames
+STEER_GAIN_RAMP_FRAMES = 10  # frames (~1 s at 10 Hz) to ramp from STEER_GAIN to STEER_GAIN_MAX
+STEER_GAIN_TWO        = 35   # two-blob regime — gentle correction only
 ERROR_ALPHA         = 0.25   # EWMA on raw error: smaller = smoother but laggier
 TURN_SLOWDOWN       = 0.55   # at |err|=1, forward speed drops to SPEED * (1 - this).
                              # Lets the car physically rotate through tight turns instead of overshooting.
 INSIDE_REVERSE_CAP  = 0      # disabled — inside wheel only slows, never reverses.
                              # Re-enable (e.g. 20) only if turns are too wide after barrier detection works.
-BARRIER_WIDTH_FRAC  = 0.80   # single blob wider than this fraction of frame → horizontal barrier
+BARRIER_WIDTH_FRAC  = 0.85   # single blob wider than this fraction of frame → horizontal barrier
 LANE_WIDTH_DEFAULT  = 0.60   # initial lane width as a fraction of frame width
 LANE_WIDTH_ALPHA    = 0.85   # EWMA on lane-width estimate (slow update)
 SIDE_FLIP_PX        = 80     # in single-blob mode, the locked side flips only after the
@@ -231,6 +233,7 @@ _error_ewma    = 0.0     # smoothed steering error in [-1, +1]
 _lost_count    = 0       # consecutive frames with no usable detection
 _locked_side   = None    # "left"|"right"|None — sticky identity for single-blob mode;
                          # set on first single-blob frame, cleared when both blobs reappear
+_one_blob_frames    = 0       # consecutive frames spent in one_left or one_right
 _barrier_turning    = False   # True while executing a barrier pivot manoeuvre
 _barrier_direction  = None   # "left"|"right" — which way to pivot during barrier
 _barrier_flip_count = 0      # how many direction flips in the current barrier event
@@ -243,6 +246,7 @@ def reset_steering_state():
     property and a good estimate from the previous run beats the default."""
     global _prev_left_x, _prev_right_x, _error_ewma, _lost_count, _locked_side
     global _barrier_turning, _barrier_direction, _barrier_flip_count, _barrier_turn_start
+    global _one_blob_frames
     _prev_left_x        = None
     _prev_right_x       = None
     _error_ewma         = 0.0
@@ -252,6 +256,7 @@ def reset_steering_state():
     _barrier_direction  = None
     _barrier_flip_count = 0
     _barrier_turn_start = 0.0
+    _one_blob_frames    = 0
 
 
 def decide_steering(mask):
@@ -390,6 +395,7 @@ def decide_steering(mask):
 def inference_loop():
     global annotated_frame, last_inference_ts
     global _barrier_turning, _barrier_direction, _barrier_flip_count, _barrier_turn_start
+    global _one_blob_frames
     while True:
         try:
             # Grab the most recent frame (non-blocking — skip if nothing new yet)
@@ -423,6 +429,7 @@ def inference_loop():
                 _barrier_turning    = False
                 _barrier_direction  = None
                 _barrier_flip_count = 0
+                _one_blob_frames    = 0
             elif _barrier_turning:
                 now = time.monotonic()
                 if regime == "two":
@@ -458,6 +465,7 @@ def inference_loop():
                 _barrier_direction  = dbg.get("barrier_dir") or "right"
                 _barrier_flip_count = 0
                 _barrier_turn_start = time.monotonic()
+                _one_blob_frames    = 0
                 if _barrier_direction == "right":
                     left_duty, right_duty = BARRIER_SPEED, -BARRIER_SPEED
                 else:
@@ -473,8 +481,15 @@ def inference_loop():
                 use_normal_steering = True
 
             if use_normal_steering:
-                base_speed = SPEED_ONE_BLOB if regime in ("one_left", "one_right") else SPEED
-                gain       = STEER_GAIN_TWO  if regime == "two"                     else STEER_GAIN
+                if regime in ("one_left", "one_right"):
+                    _one_blob_frames += 1
+                    ramp = min(_one_blob_frames / STEER_GAIN_RAMP_FRAMES, 1.0)
+                    gain = STEER_GAIN + (STEER_GAIN_MAX - STEER_GAIN) * ramp
+                    base_speed = SPEED_ONE_BLOB
+                else:
+                    _one_blob_frames = 0
+                    gain = STEER_GAIN_TWO
+                    base_speed = SPEED
                 slow_factor = 1.0 - TURN_SLOWDOWN * abs(error)
                 base = base_speed * slow_factor
                 left_duty  = max(-INSIDE_REVERSE_CAP, min(100, base + gain * error))
