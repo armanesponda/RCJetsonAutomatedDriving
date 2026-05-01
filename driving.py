@@ -248,6 +248,10 @@ _barrier_entry_error = 0.0   # _error_ewma latched at the moment barrier mode wa
                              # which way the lane was already curving).
 _barrier_dir_source = None   # "ewma"|"fallback" — which signal picked the direction this
                              # event. Diagnostic only.
+_barrier_stuck      = False  # latched True after MAX_FLIPS exhaustion; survives across
+                             # frames so the entry branch doesn't immediately re-arm. Cleared
+                             # the first frame regime is no longer "barrier" (driver
+                             # repositioned, or wide-blob condition genuinely cleared).
 
 
 def reset_steering_state():
@@ -256,7 +260,7 @@ def reset_steering_state():
     property and a good estimate from the previous run beats the default."""
     global _prev_left_x, _prev_right_x, _error_ewma, _lost_count, _locked_side
     global _barrier_turning, _barrier_direction, _barrier_flip_count, _barrier_turn_start
-    global _barrier_entry_error, _barrier_dir_source
+    global _barrier_entry_error, _barrier_dir_source, _barrier_stuck
     _prev_left_x         = None
     _prev_right_x        = None
     _error_ewma          = 0.0
@@ -268,6 +272,7 @@ def reset_steering_state():
     _barrier_turn_start  = 0.0
     _barrier_entry_error = 0.0
     _barrier_dir_source  = None
+    _barrier_stuck       = False
 
 
 def _reset_for_barrier_exit():
@@ -425,7 +430,7 @@ def decide_steering(mask):
 def inference_loop():
     global annotated_frame, last_inference_ts
     global _barrier_turning, _barrier_direction, _barrier_flip_count, _barrier_turn_start
-    global _barrier_entry_error, _barrier_dir_source
+    global _barrier_entry_error, _barrier_dir_source, _barrier_stuck
     while True:
         try:
             # Grab the most recent frame (non-blocking — skip if nothing new yet)
@@ -454,15 +459,23 @@ def inference_loop():
             left_duty = right_duty = 0
             use_normal_steering = False
 
+            # Clear the stuck latch as soon as the barrier classification clears
+            # (driver repositioned, mask changed). Must happen before the entry
+            # branch is evaluated, or the latch would never let entry re-arm.
+            if is_autonomous and _barrier_stuck and regime != "barrier":
+                _barrier_stuck = False
+
             if not is_autonomous:
                 stop_motors()
                 _barrier_turning    = False
                 _barrier_direction  = None
                 _barrier_flip_count = 0
+                _barrier_stuck      = False
             elif _barrier_turning:
                 now = time.monotonic()
-                if regime == "two":
-                    # Found the opening — resume normal driving.
+                if regime in ("two", "one_left", "one_right"):
+                    # Pivot exposed a usable lane view — exit and let normal
+                    # steering take over from a clean slate.
                     _barrier_turning    = False
                     _barrier_direction  = None
                     _barrier_flip_count = 0
@@ -470,9 +483,12 @@ def inference_loop():
                     use_normal_steering = True
                 elif now - _barrier_turn_start > BARRIER_FLIP_TIMEOUT:
                     if _barrier_flip_count >= BARRIER_MAX_FLIPS:
-                        # No progress after several flips — give up and stop.
+                        # No progress after several flips — give up and stay
+                        # stopped. _barrier_stuck persists across frames so the
+                        # entry branch won't re-arm until the regime clears.
                         _barrier_turning    = False
                         _barrier_flip_count = 0
+                        _barrier_stuck      = True
                         stop_motors()
                     else:
                         # Try the other direction.
@@ -490,7 +506,7 @@ def inference_loop():
                     else:
                         left_duty, right_duty = -BARRIER_SPEED, BARRIER_SPEED
                     drive(left_duty, right_duty)
-            elif regime == "barrier":
+            elif regime == "barrier" and not _barrier_stuck:
                 _barrier_turning     = True
                 _barrier_entry_error = error
                 # Primary signal: sign of pre-barrier _error_ewma. The lane curves
@@ -510,6 +526,9 @@ def inference_loop():
                 else:
                     left_duty, right_duty = -BARRIER_SPEED, BARRIER_SPEED
                 drive(left_duty, right_duty)
+            elif regime == "barrier" and _barrier_stuck:
+                # Flip-exhausted; stay stopped until the wide-blob condition clears.
+                stop_motors()
             elif regime == "lost":
                 # Hold last command at reduced speed for a short window, then stop.
                 if _lost_count <= LOST_FRAMES_HOLD:
