@@ -26,7 +26,7 @@ PORT       = 5000
 SPEED          = 30   # base forward duty cycle (0–100); both wheels at this on a perfect straight
 SPEED_ONE_BLOB = 20   # reduced base speed when only one boundary is visible (mid-turn)
 SPEED_LOST     = 15   # speed while coasting through a brief detection dropout
-BARRIER_SPEED  = 25   # pivot speed when a horizontal barrier is detected
+BARRIER_SPEED  = 15   # pivot speed when a horizontal barrier is detected
 
 # ── Steering controller knobs ─────────────────────────────────────────────────
 # error ∈ [-1, +1]: -1 = lane center is at far left of frame, +1 = far right.
@@ -39,7 +39,7 @@ TURN_SLOWDOWN       = 0.55   # at |err|=1, forward speed drops to SPEED * (1 - t
                              # Lets the car physically rotate through tight turns instead of overshooting.
 INSIDE_REVERSE_CAP  = 0      # disabled — inside wheel only slows, never reverses.
                              # Re-enable (e.g. 20) only if turns are too wide after barrier detection works.
-BARRIER_WIDTH_FRAC  = 0.75   # single blob wider than this fraction of frame → horizontal barrier
+BARRIER_WIDTH_FRAC  = 0.80   # single blob wider than this fraction of frame → horizontal barrier
 LANE_WIDTH_DEFAULT  = 0.60   # initial lane width as a fraction of frame width
 LANE_WIDTH_ALPHA    = 0.85   # EWMA on lane-width estimate (slow update)
 SIDE_FLIP_PX        = 80     # in single-blob mode, the locked side flips only after the
@@ -228,6 +228,8 @@ _error_ewma    = 0.0     # smoothed steering error in [-1, +1]
 _lost_count    = 0       # consecutive frames with no usable detection
 _locked_side   = None    # "left"|"right"|None — sticky identity for single-blob mode;
                          # set on first single-blob frame, cleared when both blobs reappear
+_barrier_turning   = False  # True while executing a barrier pivot manoeuvre
+_barrier_direction = None   # "left"|"right" — which way to pivot during barrier
 
 
 def reset_steering_state():
@@ -235,11 +237,14 @@ def reset_steering_state():
     Lane-width estimate is intentionally kept — it's a slowly-changing physical
     property and a good estimate from the previous run beats the default."""
     global _prev_left_x, _prev_right_x, _error_ewma, _lost_count, _locked_side
-    _prev_left_x  = None
-    _prev_right_x = None
-    _error_ewma   = 0.0
-    _lost_count   = 0
-    _locked_side  = None
+    global _barrier_turning, _barrier_direction
+    _prev_left_x       = None
+    _prev_right_x      = None
+    _error_ewma        = 0.0
+    _lost_count        = 0
+    _locked_side       = None
+    _barrier_turning   = False
+    _barrier_direction = None
 
 
 def decide_steering(mask):
@@ -267,13 +272,15 @@ def decide_steering(mask):
 
     num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(bottom)
     blobs = [
-        (float(centroids[i][0]), int(stats[i, cv2.CC_STAT_AREA]), int(stats[i, cv2.CC_STAT_WIDTH]))
+        (float(centroids[i][0]), int(stats[i, cv2.CC_STAT_AREA]),
+         int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_LEFT]))
         for i in range(1, num_labels)
         if stats[i, cv2.CC_STAT_AREA] >= MIN_BLOB_AREA
     ]
 
     debug = {"left_x": None, "right_x": None, "lane_x": None,
-             "lane_width": _lane_width_px, "n_blobs": len(blobs)}
+             "lane_width": _lane_width_px, "n_blobs": len(blobs),
+             "barrier_dir": None}
 
     # ── Regime: lost ──────────────────────────────────────────────────────────
     if not blobs:
@@ -288,8 +295,11 @@ def decide_steering(mask):
     # ── Regime: barrier — single connected blob spanning 80%+ of frame width ─
     # A 90° corner tape appears as one wide connected blob. Two separate lane
     # boundaries will never individually be this wide.
-    for cx, area, blob_w in blobs:
+    for cx, area, blob_w, blob_left in blobs:
         if blob_w > BARRIER_WIDTH_FRAC * w:
+            right_gap = w - (blob_left + blob_w)
+            left_gap  = blob_left
+            debug["barrier_dir"] = "right" if right_gap >= left_gap else "left"
             debug["lane_x"] = w / 2
             return 0.0, "barrier", debug
 
@@ -311,6 +321,17 @@ def decide_steering(mask):
         lane_x = (left_x + right_x) / 2
         regime = "two"
         _locked_side = None   # both visible — release any single-blob lock
+
+        # Proximity override — if either boundary has crept past 45/55% of frame,
+        # the car is nearly over the line. Stop and pivot away from that boundary.
+        if left_x > w * 0.45:
+            debug["barrier_dir"] = "right"
+            debug["lane_x"] = lane_x
+            return 0.0, "barrier", debug
+        if right_x < w * 0.55:
+            debug["barrier_dir"] = "left"
+            debug["lane_x"] = lane_x
+            return 0.0, "barrier", debug
 
     # ── Regime: one blob — sticky-with-hysteresis identity ───────────────────
     else:
@@ -363,7 +384,7 @@ def decide_steering(mask):
 # Reads the latest camera frame, runs the segmentation model, decides a steering
 # command, drives the motors, then writes an annotated frame for the web stream.
 def inference_loop():
-    global annotated_frame, last_inference_ts
+    global annotated_frame, last_inference_ts, _barrier_turning, _barrier_direction
     while True:
         try:
             # Grab the most recent frame (non-blocking — skip if nothing new yet)
@@ -389,23 +410,40 @@ def inference_loop():
             with auto_lock:
                 is_autonomous = autonomous
 
+            left_duty = right_duty = 0
+            use_normal_steering = False
+
             if not is_autonomous:
-                left_duty = right_duty = 0
                 stop_motors()
+                _barrier_turning   = False
+                _barrier_direction = None
+            elif _barrier_turning:
+                # Mid-pivot: keep turning until we see both lane lines again.
+                if regime == "two":
+                    _barrier_turning   = False
+                    _barrier_direction = None
+                    use_normal_steering = True
+                else:
+                    if _barrier_direction == "right":
+                        left_duty, right_duty = BARRIER_SPEED, -BARRIER_SPEED
+                    else:
+                        left_duty, right_duty = -BARRIER_SPEED, BARRIER_SPEED
+                    drive(left_duty, right_duty)
             elif regime == "barrier":
-                # Horizontal tape across frame — 90° corner. Pivot right until clear.
-                left_duty, right_duty = BARRIER_SPEED, -BARRIER_SPEED
-                drive(left_duty, right_duty)
+                # Enter barrier mode: stop first, then start pivoting next frame.
+                _barrier_turning   = True
+                _barrier_direction = dbg.get("barrier_dir") or "right"
+                stop_motors()
             elif regime == "lost":
                 # Hold last command at reduced speed for a short window, then stop.
                 if _lost_count <= LOST_FRAMES_HOLD:
                     left_duty  = max(0, min(100, SPEED_LOST + STEER_GAIN * error))
                     right_duty = max(0, min(100, SPEED_LOST - STEER_GAIN * error))
-                else:
-                    left_duty = right_duty = 0
                 drive(left_duty, right_duty)
             else:
-                # Single-blob regime: slow down — car is mid-turn with one boundary hidden.
+                use_normal_steering = True
+
+            if use_normal_steering:
                 base_speed = SPEED_ONE_BLOB if regime in ("one_left", "one_right") else SPEED
                 slow_factor = 1.0 - TURN_SLOWDOWN * abs(error)
                 base = base_speed * slow_factor
