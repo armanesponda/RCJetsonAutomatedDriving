@@ -264,7 +264,8 @@ def decide_steering(mask):
     # Search strip: skip the top horizon area; everything below is fair game.
     # Camera is tilted down hard enough that "near tape" actually appears in the
     # middle of the frame, not the bottom.
-    bottom = mask_u8[int(h * STRIP_TOP_FRAC):, :]
+    strip_start = int(h * STRIP_TOP_FRAC)
+    bottom = mask_u8[strip_start:, :]
 
     # Light morphological open to suppress speckle before connected components.
     kernel = np.ones((3, 3), np.uint8)
@@ -272,8 +273,12 @@ def decide_steering(mask):
 
     num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(bottom)
     blobs = [
-        (float(centroids[i][0]), int(stats[i, cv2.CC_STAT_AREA]),
-         int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_LEFT]))
+        (float(centroids[i][0]),            # [0] cx  (strip coords)
+         int(stats[i, cv2.CC_STAT_AREA]),   # [1] area
+         int(stats[i, cv2.CC_STAT_WIDTH]),  # [2] blob width
+         int(stats[i, cv2.CC_STAT_LEFT]),   # [3] left edge X
+         int(stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT]) + strip_start)
+        # [4] bottom edge Y in original-frame coordinates
         for i in range(1, num_labels)
         if stats[i, cv2.CC_STAT_AREA] >= MIN_BLOB_AREA
     ]
@@ -295,7 +300,7 @@ def decide_steering(mask):
     # ── Regime: barrier — single connected blob spanning 80%+ of frame width ─
     # A 90° corner tape appears as one wide connected blob. Two separate lane
     # boundaries will never individually be this wide.
-    for cx, area, blob_w, blob_left in blobs:
+    for cx, area, blob_w, blob_left, bottom_y in blobs:
         if blob_w > BARRIER_WIDTH_FRAC * w:
             right_gap = w - (blob_left + blob_w)
             left_gap  = blob_left
@@ -322,13 +327,16 @@ def decide_steering(mask):
         regime = "two"
         _locked_side = None   # both visible — release any single-blob lock
 
-        # Proximity override — if either boundary has crept past 45/55% of frame,
-        # the car is nearly over the line. Stop and pivot away from that boundary.
-        if left_x > w * 0.45:
+        # Proximity override — only for tape in the bottom 15% of the frame
+        # (physically close to the car). A distant barrier in the upper part of
+        # the detection strip must NOT trigger this.
+        left_bottom_y  = blobs_sorted[0][4]
+        right_bottom_y = blobs_sorted[-1][4]
+        if left_x > w * 0.45 and left_bottom_y > h * 0.85:
             debug["barrier_dir"] = "right"
             debug["lane_x"] = lane_x
             return 0.0, "barrier", debug
-        if right_x < w * 0.55:
+        if right_x < w * 0.55 and right_bottom_y > h * 0.85:
             debug["barrier_dir"] = "left"
             debug["lane_x"] = lane_x
             return 0.0, "barrier", debug
@@ -430,10 +438,13 @@ def inference_loop():
                         left_duty, right_duty = -BARRIER_SPEED, BARRIER_SPEED
                     drive(left_duty, right_duty)
             elif regime == "barrier":
-                # Enter barrier mode: stop first, then start pivoting next frame.
                 _barrier_turning   = True
                 _barrier_direction = dbg.get("barrier_dir") or "right"
-                stop_motors()
+                if _barrier_direction == "right":
+                    left_duty, right_duty = BARRIER_SPEED, -BARRIER_SPEED
+                else:
+                    left_duty, right_duty = -BARRIER_SPEED, BARRIER_SPEED
+                drive(left_duty, right_duty)
             elif regime == "lost":
                 # Hold last command at reduced speed for a short window, then stop.
                 if _lost_count <= LOST_FRAMES_HOLD:
