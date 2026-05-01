@@ -37,7 +37,7 @@ BARRIER_MAX_FLIPS    = 3     # give up (stop) after this many flips with no prog
 # Higher gain = sharper turns + more wobble. Tune on the car.
 STEER_GAIN            = 50   # one-blob starting gain; ramps up the longer the car stays in one-blob
 STEER_GAIN_MAX        = 70   # one-blob gain cap after STEER_GAIN_RAMP_FRAMES consecutive frames
-STEER_GAIN_RAMP_FRAMES = 10  # frames (~1 s at 10 Hz) to ramp from STEER_GAIN to STEER_GAIN_MAX
+STEER_GAIN_RAMP_FRAMES = 20  # frames (~1 s at 10 Hz) to ramp from STEER_GAIN to STEER_GAIN_MAX
 STEER_GAIN_TWO        = 35   # two-blob regime — gentle correction only
 ERROR_ALPHA         = 0.25   # EWMA on raw error: smaller = smoother but laggier
 TURN_SLOWDOWN       = 0.55   # at |err|=1, forward speed drops to SPEED * (1 - this).
