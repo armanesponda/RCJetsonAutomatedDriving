@@ -39,7 +39,7 @@ TURN_SLOWDOWN       = 0.55   # at |err|=1, forward speed drops to SPEED * (1 - t
                              # Lets the car physically rotate through tight turns instead of overshooting.
 INSIDE_REVERSE_CAP  = 0      # disabled — inside wheel only slows, never reverses.
                              # Re-enable (e.g. 20) only if turns are too wide after barrier detection works.
-BARRIER_WIDTH_FRAC  = 0.75   # if two-blob span > this fraction of frame width → horizontal barrier, not lane
+BARRIER_WIDTH_FRAC  = 0.75   # single blob wider than this fraction of frame → horizontal barrier
 LANE_WIDTH_DEFAULT  = 0.60   # initial lane width as a fraction of frame width
 LANE_WIDTH_ALPHA    = 0.85   # EWMA on lane-width estimate (slow update)
 SIDE_FLIP_PX        = 80     # in single-blob mode, the locked side flips only after the
@@ -267,7 +267,7 @@ def decide_steering(mask):
 
     num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(bottom)
     blobs = [
-        (float(centroids[i][0]), int(stats[i, cv2.CC_STAT_AREA]))
+        (float(centroids[i][0]), int(stats[i, cv2.CC_STAT_AREA]), int(stats[i, cv2.CC_STAT_WIDTH]))
         for i in range(1, num_labels)
         if stats[i, cv2.CC_STAT_AREA] >= MIN_BLOB_AREA
     ]
@@ -278,9 +278,6 @@ def decide_steering(mask):
     # ── Regime: lost ──────────────────────────────────────────────────────────
     if not blobs:
         _lost_count += 1
-        # Past the hold window the motors are already off; the next reacquire
-        # should evaluate identity and error from scratch instead of resuming
-        # whatever turn was in progress when we lost sight.
         if _lost_count > LOST_FRAMES_HOLD:
             _prev_left_x  = None
             _prev_right_x = None
@@ -288,20 +285,22 @@ def decide_steering(mask):
             _error_ewma   = 0.0
         return _error_ewma, "lost", debug
 
+    # ── Regime: barrier — single connected blob spanning 80%+ of frame width ─
+    # A 90° corner tape appears as one wide connected blob. Two separate lane
+    # boundaries will never individually be this wide.
+    for cx, area, blob_w in blobs:
+        if blob_w > BARRIER_WIDTH_FRAC * w:
+            debug["lane_x"] = w / 2
+            return 0.0, "barrier", debug
+
     _lost_count = 0
-    blobs_sorted = sorted(blobs, key=lambda b: b[0])
+    blobs_sorted = sorted(blobs, key=lambda b: b[0])  # sort by centroid X
 
     # ── Regime: two or more blobs — use outermost as the two boundaries ──────
     if len(blobs_sorted) >= 2:
         left_x  = blobs_sorted[0][0]
         right_x = blobs_sorted[-1][0]
         observed_width = right_x - left_x
-
-        # A horizontal barrier (90° corner tape) spans most of the frame width.
-        # Two lane boundaries never do — the lane is always narrower than the frame.
-        if observed_width > BARRIER_WIDTH_FRAC * w:
-            debug["lane_x"] = w / 2
-            return 0.0, "barrier", debug
 
         # Only update lane width from sane observations (avoid degenerate
         # near-zero widths from two blobs of the same boundary fragmented).
@@ -614,5 +613,3 @@ if __name__ == "__main__":
 
     print(f"Open http://<jetson-ip>:{PORT} in your browser")
     keyboard_listener()   # runs on main thread — stdin works correctly
-
-
