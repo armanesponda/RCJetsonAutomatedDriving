@@ -26,9 +26,14 @@ PORT       = 5000
 SPEED          = 30   # base forward duty cycle (0–100); both wheels at this on a perfect straight
 SPEED_ONE_BLOB = 25   # reduced base speed when only one boundary is visible (mid-turn)
 SPEED_LOST     = 25   # speed while coasting through a brief detection dropout
-BARRIER_SPEED        = 30    # pivot speed when a horizontal barrier is detected (pivot is harder than straight)
-BARRIER_FLIP_TIMEOUT = 1.0   # seconds to try one pivot direction before flipping
-BARRIER_MAX_FLIPS    = 3     # give up (stop) after this many flips with no progress
+BARRIER_SPEED          = 30    # pivot speed when a horizontal barrier is detected (pivot is harder than straight)
+BARRIER_FLIP_TIMEOUT   = 1.0   # seconds to try one pivot direction before flipping
+BARRIER_MAX_FLIPS      = 3     # give up (stop) after this many flips with no progress
+BARRIER_STRIP_TOP_FRAC = 0.30  # barrier detection scans a wider strip than lane extraction —
+                               # a horizontal bar can be visible in the upper half before it's
+                               # close enough to enter the lane-extraction strip.
+BARRIER_COL_MIN_PX     = 3     # a column "counts" as filled if at least this many strip rows
+                               # are tape. Filters speckle without rejecting thin bars.
 
 # ── Steering controller knobs ─────────────────────────────────────────────────
 # error ∈ [-1, +1]: -1 = lane center is at far left of frame, +1 = far right.
@@ -292,7 +297,7 @@ def decide_steering(mask):
 
     debug = {"left_x": None, "right_x": None, "lane_x": None,
              "lane_width": _lane_width_px, "n_blobs": len(blobs),
-             "barrier_dir": None}
+             "barrier_dir": None, "filled_cols": 0}
 
     # ── Regime: lost ──────────────────────────────────────────────────────────
     if not blobs:
@@ -304,19 +309,23 @@ def decide_steering(mask):
             _error_ewma   = 0.0
         return _error_ewma, "lost", debug
 
-    # ── Regime: barrier — single connected blob spanning 80%+ of frame width ─
-    # A 90° corner tape appears as one wide connected blob. Two separate lane
-    # boundaries will never individually be this wide.
-    for cx, area, blob_w, blob_left, bottom_y in blobs:
-        if blob_w > BARRIER_WIDTH_FRAC * w:
-            # Count tape pixels in each half of the strip.
-            # The side with fewer pixels has less tape → more open space → turn that way.
-            # This naturally accounts for distance: closer tape is larger in the frame.
-            left_px  = int(bottom[:, :w // 2].sum())
-            right_px = int(bottom[:, w // 2:].sum())
-            debug["barrier_dir"] = "right" if right_px <= left_px else "left"
-            debug["lane_x"] = w / 2
-            return 0.0, "barrier", debug
+    # ── Regime: barrier — column projection on a wider strip ─────────────────
+    # A horizontal tape bar fills a contiguous range of columns regardless of
+    # how the segmentation network fragments it into connected components.
+    # Per-blob width was fragile to fragmentation; column count is not.
+    barrier_strip = mask_u8[int(h * BARRIER_STRIP_TOP_FRAC):, :]
+    barrier_strip = cv2.morphologyEx(barrier_strip, cv2.MORPH_OPEN, kernel)
+    col_counts    = barrier_strip.sum(axis=0)
+    filled_cols   = int((col_counts >= BARRIER_COL_MIN_PX).sum())
+    debug["filled_cols"] = filled_cols
+    if filled_cols > BARRIER_WIDTH_FRAC * w:
+        # Pixel-count direction picker (kept for now; commit 2 inverts it and
+        # adds the EWMA latch as the primary signal).
+        left_px  = int(barrier_strip[:, :w // 2].sum())
+        right_px = int(barrier_strip[:, w // 2:].sum())
+        debug["barrier_dir"] = "right" if right_px <= left_px else "left"
+        debug["lane_x"] = w / 2
+        return _error_ewma, "barrier", debug
 
     _lost_count = 0
     blobs_sorted = sorted(blobs, key=lambda b: b[0])  # sort by centroid X
