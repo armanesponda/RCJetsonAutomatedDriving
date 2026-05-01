@@ -326,7 +326,7 @@ def decide_steering(mask):
 
     debug = {"left_x": None, "right_x": None, "lane_x": None,
              "lane_width": _lane_width_px, "n_blobs": len(blobs),
-             "barrier_dir": None, "filled_cols": 0}
+             "barrier_dir": None, "barrier_dir_hint": None, "filled_cols": 0}
 
     # ── Regime: lost ──────────────────────────────────────────────────────────
     if not blobs:
@@ -346,16 +346,20 @@ def decide_steering(mask):
     barrier_strip = cv2.morphologyEx(barrier_strip, cv2.MORPH_OPEN, kernel)
     col_counts    = barrier_strip.sum(axis=0)
     filled_cols   = int((col_counts >= BARRIER_COL_MIN_PX).sum())
-    debug["filled_cols"] = filled_cols
+    # Denser-side hint computed every frame so the overlay can show what the
+    # fallback heuristic would pick — useful for spotting cases where the hint
+    # was already wrong frames before barrier entry.
+    left_px  = int(barrier_strip[:, :w // 2].sum())
+    right_px = int(barrier_strip[:, w // 2:].sum())
+    hint     = "right" if right_px >= left_px else "left"
+    debug["filled_cols"]      = filled_cols
+    debug["barrier_dir_hint"] = hint
     if filled_cols > BARRIER_WIDTH_FRAC * w:
-        # Fallback direction heuristic: pivot toward the DENSER half. On a
-        # single-lane road, the inside-of-turn edge bunches up dense pixels on
-        # the side the lane continues. Used only when |_error_ewma| at entry
-        # is below the deadband (see inference_loop entry branch).
-        left_px  = int(barrier_strip[:, :w // 2].sum())
-        right_px = int(barrier_strip[:, w // 2:].sum())
-        debug["barrier_dir"] = "right" if right_px >= left_px else "left"
-        debug["lane_x"] = w / 2
+        # Pivot toward the DENSER half. On a single-lane road, the inside-of-turn
+        # edge bunches up dense pixels on the side the lane continues. Used only
+        # when |_error_ewma| at entry is below the deadband (see entry branch).
+        debug["barrier_dir"] = hint
+        debug["lane_x"]      = w / 2
         return _error_ewma, "barrier", debug
 
     _lost_count = 0
@@ -557,14 +561,31 @@ def inference_loop():
                 cv2.line(vis, (frame.shape[1] // 2, fy - 20),
                               (frame.shape[1] // 2, fy + 20), (255, 255, 255), 1)
             auto_str  = "AUTO" if is_autonomous else "IDLE"
+            if _barrier_stuck:
+                mode_tag = "  [STUCK]"
+            elif _barrier_turning:
+                mode_tag = "  [BARRIER]"
+            else:
+                mode_tag = ""
+            hint_str = dbg.get("barrier_dir_hint")
+            hint_str = f"  bdir:{hint_str[0].upper()}" if hint_str else ""
             label1 = (f"{auto_str}  regime:{regime}  err:{error:+.2f}"
-                      f"  L:{int(left_duty)} R:{int(right_duty)}")
+                      f"  L:{int(left_duty)} R:{int(right_duty)}{mode_tag}")
             label2 = (f"blobs:{dbg['n_blobs']}  lane_w:{int(dbg['lane_width'])}"
-                      f"  lost:{_lost_count}  conf:{max_conf:.2f}")
+                      f"  lost:{_lost_count}  conf:{max_conf:.2f}{hint_str}")
             cv2.putText(vis, label1, (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             cv2.putText(vis, label2, (10, 52),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            # Line 3: barrier diagnostics — only when actively pivoting or stuck.
+            if _barrier_turning or _barrier_stuck:
+                src   = _barrier_dir_source or "?"
+                bdir  = _barrier_direction or "?"
+                label3 = (f"dir:{bdir}  flips:{_barrier_flip_count}/{BARRIER_MAX_FLIPS}"
+                          f"  entry_err:{_barrier_entry_error:+.2f}  src:{src}"
+                          f"  cols:{dbg['filled_cols']}/{pred_mask.shape[1]}")
+                cv2.putText(vis, label3, (10, 74),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
             with annotated_lock:
                 annotated_frame = vis
