@@ -35,7 +35,8 @@ BARRIER_MAX_FLIPS    = 3     # give up (stop) after this many flips with no prog
 # left_duty  = SPEED + STEER_GAIN * error
 # right_duty = SPEED - STEER_GAIN * error
 # Higher gain = sharper turns + more wobble. Tune on the car.
-STEER_GAIN          = 40
+STEER_GAIN          = 50   # one-blob regime (mid-turn, one boundary visible) — sharper
+STEER_GAIN_TWO      = 35   # two-blob regime (both boundaries visible) — gentle correction
 ERROR_ALPHA         = 0.25   # EWMA on raw error: smaller = smoother but laggier
 TURN_SLOWDOWN       = 0.55   # at |err|=1, forward speed drops to SPEED * (1 - this).
                              # Lets the car physically rotate through tight turns instead of overshooting.
@@ -473,10 +474,11 @@ def inference_loop():
 
             if use_normal_steering:
                 base_speed = SPEED_ONE_BLOB if regime in ("one_left", "one_right") else SPEED
+                gain       = STEER_GAIN_TWO  if regime == "two"                     else STEER_GAIN
                 slow_factor = 1.0 - TURN_SLOWDOWN * abs(error)
                 base = base_speed * slow_factor
-                left_duty  = max(-INSIDE_REVERSE_CAP, min(100, base + STEER_GAIN * error))
-                right_duty = max(-INSIDE_REVERSE_CAP, min(100, base - STEER_GAIN * error))
+                left_duty  = max(-INSIDE_REVERSE_CAP, min(100, base + gain * error))
+                right_duty = max(-INSIDE_REVERSE_CAP, min(100, base - gain * error))
                 drive(left_duty, right_duty)
 
             # --- Annotate frame for streaming ---
