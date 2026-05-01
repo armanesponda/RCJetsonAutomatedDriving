@@ -27,7 +27,7 @@ SPEED          = 30   # base forward duty cycle (0–100); both wheels at this o
 SPEED_ONE_BLOB = 25   # reduced base speed when only one boundary is visible (mid-turn)
 SPEED_LOST     = 25   # speed while coasting through a brief detection dropout
 BARRIER_SPEED        = 30    # pivot speed when a horizontal barrier is detected (pivot is harder than straight)
-BARRIER_FLIP_TIMEOUT = 2.0   # seconds to try one pivot direction before flipping
+BARRIER_FLIP_TIMEOUT = 1.0   # seconds to try one pivot direction before flipping
 BARRIER_MAX_FLIPS    = 3     # give up (stop) after this many flips with no progress
 
 # ── Steering controller knobs ─────────────────────────────────────────────────
@@ -335,20 +335,6 @@ def decide_steering(mask):
         lane_x = (left_x + right_x) / 2
         regime = "two"
         _locked_side = None   # both visible — release any single-blob lock
-
-        # Proximity override — only for tape in the bottom 15% of the frame
-        # (physically close to the car). A distant barrier in the upper part of
-        # the detection strip must NOT trigger this.
-        left_bottom_y  = blobs_sorted[0][4]
-        right_bottom_y = blobs_sorted[-1][4]
-        if left_x > w * 0.45 and left_bottom_y > h * 0.85:
-            debug["barrier_dir"] = "right"
-            debug["lane_x"] = lane_x
-            return 0.0, "barrier", debug
-        if right_x < w * 0.55 and right_bottom_y > h * 0.85:
-            debug["barrier_dir"] = "left"
-            debug["lane_x"] = lane_x
-            return 0.0, "barrier", debug
 
     # ── Regime: one blob — sticky-with-hysteresis identity ───────────────────
     else:
