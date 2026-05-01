@@ -24,9 +24,11 @@ MODEL_PATH = "best_model.pth"
 INPUT_SIZE = (640, 360)   # width, height fed to the model
 PORT       = 5000
 SPEED          = 30   # base forward duty cycle (0–100); both wheels at this on a perfect straight
-SPEED_ONE_BLOB = 20   # reduced base speed when only one boundary is visible (mid-turn)
-SPEED_LOST     = 15   # speed while coasting through a brief detection dropout
-BARRIER_SPEED  = 15   # pivot speed when a horizontal barrier is detected
+SPEED_ONE_BLOB = 25   # reduced base speed when only one boundary is visible (mid-turn)
+SPEED_LOST     = 25   # speed while coasting through a brief detection dropout
+BARRIER_SPEED        = 30    # pivot speed when a horizontal barrier is detected (pivot is harder than straight)
+BARRIER_FLIP_TIMEOUT = 2.0   # seconds to try one pivot direction before flipping
+BARRIER_MAX_FLIPS    = 3     # give up (stop) after this many flips with no progress
 
 # ── Steering controller knobs ─────────────────────────────────────────────────
 # error ∈ [-1, +1]: -1 = lane center is at far left of frame, +1 = far right.
@@ -228,8 +230,10 @@ _error_ewma    = 0.0     # smoothed steering error in [-1, +1]
 _lost_count    = 0       # consecutive frames with no usable detection
 _locked_side   = None    # "left"|"right"|None — sticky identity for single-blob mode;
                          # set on first single-blob frame, cleared when both blobs reappear
-_barrier_turning   = False  # True while executing a barrier pivot manoeuvre
-_barrier_direction = None   # "left"|"right" — which way to pivot during barrier
+_barrier_turning    = False   # True while executing a barrier pivot manoeuvre
+_barrier_direction  = None   # "left"|"right" — which way to pivot during barrier
+_barrier_flip_count = 0      # how many direction flips in the current barrier event
+_barrier_turn_start = 0.0    # monotonic time when the current pivot direction started
 
 
 def reset_steering_state():
@@ -237,14 +241,16 @@ def reset_steering_state():
     Lane-width estimate is intentionally kept — it's a slowly-changing physical
     property and a good estimate from the previous run beats the default."""
     global _prev_left_x, _prev_right_x, _error_ewma, _lost_count, _locked_side
-    global _barrier_turning, _barrier_direction
-    _prev_left_x       = None
-    _prev_right_x      = None
-    _error_ewma        = 0.0
-    _lost_count        = 0
-    _locked_side       = None
-    _barrier_turning   = False
-    _barrier_direction = None
+    global _barrier_turning, _barrier_direction, _barrier_flip_count, _barrier_turn_start
+    _prev_left_x        = None
+    _prev_right_x       = None
+    _error_ewma         = 0.0
+    _lost_count         = 0
+    _locked_side        = None
+    _barrier_turning    = False
+    _barrier_direction  = None
+    _barrier_flip_count = 0
+    _barrier_turn_start = 0.0
 
 
 def decide_steering(mask):
@@ -302,9 +308,12 @@ def decide_steering(mask):
     # boundaries will never individually be this wide.
     for cx, area, blob_w, blob_left, bottom_y in blobs:
         if blob_w > BARRIER_WIDTH_FRAC * w:
-            right_gap = w - (blob_left + blob_w)
-            left_gap  = blob_left
-            debug["barrier_dir"] = "right" if right_gap >= left_gap else "left"
+            # Count tape pixels in each half of the strip.
+            # The side with fewer pixels has less tape → more open space → turn that way.
+            # This naturally accounts for distance: closer tape is larger in the frame.
+            left_px  = int(bottom[:, :w // 2].sum())
+            right_px = int(bottom[:, w // 2:].sum())
+            debug["barrier_dir"] = "right" if right_px <= left_px else "left"
             debug["lane_x"] = w / 2
             return 0.0, "barrier", debug
 
@@ -392,7 +401,8 @@ def decide_steering(mask):
 # Reads the latest camera frame, runs the segmentation model, decides a steering
 # command, drives the motors, then writes an annotated frame for the web stream.
 def inference_loop():
-    global annotated_frame, last_inference_ts, _barrier_turning, _barrier_direction
+    global annotated_frame, last_inference_ts
+    global _barrier_turning, _barrier_direction, _barrier_flip_count, _barrier_turn_start
     while True:
         try:
             # Grab the most recent frame (non-blocking — skip if nothing new yet)
@@ -423,14 +433,33 @@ def inference_loop():
 
             if not is_autonomous:
                 stop_motors()
-                _barrier_turning   = False
-                _barrier_direction = None
+                _barrier_turning    = False
+                _barrier_direction  = None
+                _barrier_flip_count = 0
             elif _barrier_turning:
-                # Mid-pivot: keep turning until we see both lane lines again.
+                now = time.monotonic()
                 if regime == "two":
-                    _barrier_turning   = False
-                    _barrier_direction = None
+                    # Found the opening — resume normal driving.
+                    _barrier_turning    = False
+                    _barrier_direction  = None
+                    _barrier_flip_count = 0
                     use_normal_steering = True
+                elif now - _barrier_turn_start > BARRIER_FLIP_TIMEOUT:
+                    if _barrier_flip_count >= BARRIER_MAX_FLIPS:
+                        # No progress after several flips — give up and stop.
+                        _barrier_turning    = False
+                        _barrier_flip_count = 0
+                        stop_motors()
+                    else:
+                        # Try the other direction.
+                        _barrier_direction  = "left" if _barrier_direction == "right" else "right"
+                        _barrier_flip_count += 1
+                        _barrier_turn_start = now
+                        if _barrier_direction == "right":
+                            left_duty, right_duty = BARRIER_SPEED, -BARRIER_SPEED
+                        else:
+                            left_duty, right_duty = -BARRIER_SPEED, BARRIER_SPEED
+                        drive(left_duty, right_duty)
                 else:
                     if _barrier_direction == "right":
                         left_duty, right_duty = BARRIER_SPEED, -BARRIER_SPEED
@@ -438,8 +467,10 @@ def inference_loop():
                         left_duty, right_duty = -BARRIER_SPEED, BARRIER_SPEED
                     drive(left_duty, right_duty)
             elif regime == "barrier":
-                _barrier_turning   = True
-                _barrier_direction = dbg.get("barrier_dir") or "right"
+                _barrier_turning    = True
+                _barrier_direction  = dbg.get("barrier_dir") or "right"
+                _barrier_flip_count = 0
+                _barrier_turn_start = time.monotonic()
                 if _barrier_direction == "right":
                     left_duty, right_duty = BARRIER_SPEED, -BARRIER_SPEED
                 else:
