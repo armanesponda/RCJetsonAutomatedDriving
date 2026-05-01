@@ -270,6 +270,19 @@ def reset_steering_state():
     _barrier_dir_source  = None
 
 
+def _reset_for_barrier_exit():
+    """Clear sticky lane-tracking state on barrier exit so the post-pivot
+    orientation isn't contaminated by pre-pivot pixel coords / locks / EWMA.
+    Preserves _lane_width_px (still valid — physical lane width didn't change)
+    and _barrier_stuck (separately managed by the stuck-latch logic)."""
+    global _prev_left_x, _prev_right_x, _error_ewma, _lost_count, _locked_side
+    _prev_left_x  = None
+    _prev_right_x = None
+    _error_ewma   = 0.0
+    _lost_count   = 0
+    _locked_side  = None
+
+
 def decide_steering(mask):
     """
     Returns (error, regime, debug).
@@ -453,6 +466,7 @@ def inference_loop():
                     _barrier_turning    = False
                     _barrier_direction  = None
                     _barrier_flip_count = 0
+                    _reset_for_barrier_exit()
                     use_normal_steering = True
                 elif now - _barrier_turn_start > BARRIER_FLIP_TIMEOUT:
                     if _barrier_flip_count >= BARRIER_MAX_FLIPS:
