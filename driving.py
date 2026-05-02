@@ -58,6 +58,11 @@ SIDE_FLIP_PX        = 80     # in single-blob mode, the locked side flips only a
 LOST_FRAMES_HOLD    = 25     # ~2.5s at 10Hz: hold last command this long before stopping
 STRIP_TOP_FRAC      = 0.50   # ignore top half of frame; only react to tape that is close to the car.
 
+# ── Obstacle avoidance (red color-threshold) ──────────────────────────────────
+OBSTACLE_MIN_AREA   = 2000   # px² in the camera strip; below this is noise
+OBSTACLE_STEER_GAIN = 55     # how hard to swerve — sharper than normal lane gain
+OBSTACLE_SPEED      = 25     # forward speed while avoiding
+
 # ── Pin definitions (BCM numbering) ────────────────────────────────────────────
 ENA = 17   # Left motor PWM   (board pin 11)
 IN1 = 5    # Left  forward    (board pin 29)
@@ -412,6 +417,45 @@ def decide_steering(mask):
     debug["lane_width"] = _lane_width_px
     return _error_ewma, regime, debug
 
+# ── Obstacle detection (red color threshold) ──────────────────────────────────
+def detect_obstacle(frame):
+    """
+    Look for the largest red object in the bottom half of the camera frame.
+    Returns (cx_norm, area) where cx_norm ∈ [-1, 1] (negative=left, positive=right)
+    indicating where the obstacle IS, so the caller steers by -cx_norm to avoid it.
+    Returns None if no red blob exceeds OBSTACLE_MIN_AREA.
+    """
+    h, w = frame.shape[:2]
+    roi = frame[int(h * STRIP_TOP_FRAC):, :]
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    # Red wraps around 0/180 in HSV — need two ranges and OR them.
+    mask_lo = cv2.inRange(hsv, (0,   110, 80), (10,  255, 255))
+    mask_hi = cv2.inRange(hsv, (170, 110, 80), (180, 255, 255))
+    red_mask = cv2.bitwise_or(mask_lo, mask_hi)
+
+    # Close small gaps so a partially-occluded object stays one blob.
+    kernel = np.ones((7, 7), np.uint8)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+
+    num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(red_mask)
+
+    best_area = 0
+    best_cx   = None
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area > best_area:
+            best_area = area
+            best_cx   = float(centroids[i][0])
+
+    if best_area < OBSTACLE_MIN_AREA:
+        return None
+
+    cx_norm = (best_cx - w / 2) / (w / 2)   # -1 (far left) … +1 (far right)
+    return cx_norm, best_area
+
+
 # ── Thread 2: inference + motor control ────────────────────────────────────────
 # Reads the latest camera frame, runs the segmentation model, decides a steering
 # command, drives the motors, then writes an annotated frame for the web stream.
@@ -437,6 +481,9 @@ def inference_loop():
             lane_prob = probs[0, 1]                 # [H, W]  probability of lane class
             max_conf  = float(lane_prob.max().cpu())
             pred_mask = (lane_prob.cpu().numpy() > 0.25)   # boolean [H, W]
+
+            # --- Obstacle detection (runs on raw camera frame, not model mask) ---
+            obstacle = detect_obstacle(frame)   # (cx_norm, area) or None
 
             # --- Motor control ---
             error, regime, dbg = decide_steering(pred_mask)
@@ -517,6 +564,16 @@ def inference_loop():
                     else:
                         left_duty, right_duty = -BARRIER_SPEED, BARRIER_SPEED
                     drive(left_duty, right_duty)
+            elif obstacle is not None:
+                # Red object detected — steer away from it.
+                # cx_norm > 0 means obstacle is on the right → avoidance_error < 0 → steer left.
+                ox, _ = obstacle
+                avoidance_error = -ox
+                slow_factor = 1.0 - TURN_SLOWDOWN * abs(avoidance_error)
+                base = OBSTACLE_SPEED * slow_factor
+                left_duty  = max(0, min(100, base + OBSTACLE_STEER_GAIN * avoidance_error))
+                right_duty = max(0, min(100, base - OBSTACLE_STEER_GAIN * avoidance_error))
+                drive(left_duty, right_duty)
             elif regime == "lost":
                 # Hold last command at reduced speed for a short window, then stop.
                 _barrier_confirm_count = 0
@@ -559,6 +616,10 @@ def inference_loop():
                 mode_tag = "  [STUCK]"
             elif _barrier_turning:
                 mode_tag = "  [BARRIER]"
+            elif obstacle is not None:
+                ox, oa = obstacle
+                side = "L" if ox < 0 else "R"
+                mode_tag = f"  [OBSTACLE-{side} {int(oa)}px]"
             else:
                 mode_tag = ""
             label1 = (f"{auto_str}  regime:{regime}  err:{error:+.2f}"
