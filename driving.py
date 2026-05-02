@@ -37,7 +37,7 @@ BARRIER_ENTRY_ERR_DEADBAND = 0.05  # if |_error_ewma| > this at barrier entry, u
 # left_duty  = SPEED + STEER_GAIN * error
 # right_duty = SPEED - STEER_GAIN * error
 # Higher gain = sharper turns + more wobble. Tune on the car.
-STEER_GAIN            = 45   # one-blob starting gain; ramps up the longer the car stays in one-blob
+STEER_GAIN            = 30   # one-blob starting gain; ramps up the longer the car stays in one-blob
 STEER_GAIN_MAX        = 60   # one-blob gain cap after STEER_GAIN_RAMP_FRAMES consecutive frames
 STEER_GAIN_RAMP_FRAMES = 35  # frames to ramp from STEER_GAIN to STEER_GAIN_MAX
 STEER_GAIN_TWO        = 35   # two-blob regime — gentle correction only
@@ -236,6 +236,7 @@ _lost_count    = 0       # consecutive frames with no usable detection
 _locked_side   = None    # "left"|"right"|None — sticky identity for single-blob mode;
                          # set on first single-blob frame, cleared when both blobs reappear
 _one_blob_frames    = 0       # consecutive frames spent in one_left or one_right
+_last_turn_dir      = None    # "left"|"right" — direction of the most recent one-blob turn; persists through brief "two" frames
 _barrier_turning    = False   # True while executing a barrier pivot manoeuvre
 _barrier_direction  = None    # "left"|"right" — which way to pivot during barrier
 _barrier_flip_count = 0       # how many direction flips in the current barrier event
@@ -249,7 +250,7 @@ def reset_steering_state():
     property and a good estimate from the previous run beats the default."""
     global _prev_left_x, _prev_right_x, _error_ewma, _lost_count, _locked_side
     global _barrier_turning, _barrier_direction, _barrier_flip_count, _barrier_turn_start
-    global _barrier_stuck, _one_blob_frames
+    global _barrier_stuck, _one_blob_frames, _last_turn_dir
     _prev_left_x        = None
     _prev_right_x       = None
     _error_ewma         = 0.0
@@ -261,6 +262,7 @@ def reset_steering_state():
     _barrier_turn_start = 0.0
     _barrier_stuck      = False
     _one_blob_frames    = 0
+    _last_turn_dir      = None
 
 
 def _reset_for_barrier_exit():
@@ -410,7 +412,7 @@ def decide_steering(mask):
 def inference_loop():
     global annotated_frame, last_inference_ts
     global _barrier_turning, _barrier_direction, _barrier_flip_count, _barrier_turn_start
-    global _barrier_stuck, _one_blob_frames
+    global _barrier_stuck, _one_blob_frames, _last_turn_dir
     while True:
         try:
             # Grab the most recent frame (non-blocking — skip if nothing new yet)
@@ -450,10 +452,11 @@ def inference_loop():
                 _barrier_flip_count = 0
                 _barrier_stuck      = False
                 _one_blob_frames    = 0
+                _last_turn_dir      = None
             elif _barrier_turning:
                 now = time.monotonic()
-                if regime in ("two", "one_left", "one_right"):
-                    # Pivot exposed a usable lane — exit and start clean.
+                if regime == "two":
+                    # Both boundaries visible — definitively clear. Exit and start clean.
                     _barrier_turning    = False
                     _barrier_direction  = None
                     _barrier_flip_count = 0
@@ -489,10 +492,14 @@ def inference_loop():
                 _barrier_flip_count = 0
                 _barrier_turn_start = time.monotonic()
                 _one_blob_frames    = 0
-                # Use the pre-barrier EWMA error to pick direction — the car was
-                # already steering this way before the barrier became visible.
-                # Falls back to pixel-count heuristic only when going dead-straight.
-                if abs(_error_ewma) >= BARRIER_ENTRY_ERR_DEADBAND:
+                # Direction priority:
+                # 1. Last one-blob turn direction — survives brief "two" transitions
+                #    that would otherwise wash out the EWMA signal.
+                # 2. EWMA error sign — reliable when EWMA hasn't decayed yet.
+                # 3. Pixel-count heuristic — fallback when going dead-straight.
+                if _last_turn_dir is not None:
+                    _barrier_direction = _last_turn_dir
+                elif abs(_error_ewma) >= BARRIER_ENTRY_ERR_DEADBAND:
                     _barrier_direction = "left" if _error_ewma < 0 else "right"
                 else:
                     _barrier_direction = dbg.get("barrier_dir") or "right"
@@ -516,6 +523,8 @@ def inference_loop():
                     ramp = min(_one_blob_frames / STEER_GAIN_RAMP_FRAMES, 1.0)
                     gain = STEER_GAIN + (STEER_GAIN_MAX - STEER_GAIN) * ramp
                     base_speed = SPEED_ONE_BLOB
+                    # one_left steers right; one_right steers left.
+                    _last_turn_dir = "right" if regime == "one_left" else "left"
                 else:
                     _one_blob_frames = 0
                     gain = STEER_GAIN_TWO
