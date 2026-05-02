@@ -29,6 +29,7 @@ SPEED_LOST     = 25   # speed while coasting through a brief detection dropout
 BARRIER_SPEED        = 30    # pivot speed when a horizontal barrier is detected (pivot is harder than straight)
 BARRIER_FLIP_TIMEOUT = 1.0   # seconds to try one pivot direction before flipping
 BARRIER_MAX_FLIPS    = 3     # give up (stop) after this many flips with no progress
+BARRIER_COL_MIN_PX   = 3     # a column counts as filled only if ≥ this many strip rows are tape
 
 # ── Steering controller knobs ─────────────────────────────────────────────────
 # error ∈ [-1, +1]: -1 = lane center is at far left of frame, +1 = far right.
@@ -37,7 +38,7 @@ BARRIER_MAX_FLIPS    = 3     # give up (stop) after this many flips with no prog
 # Higher gain = sharper turns + more wobble. Tune on the car.
 STEER_GAIN            = 50   # one-blob starting gain; ramps up the longer the car stays in one-blob
 STEER_GAIN_MAX        = 70   # one-blob gain cap after STEER_GAIN_RAMP_FRAMES consecutive frames
-STEER_GAIN_RAMP_FRAMES = 20  # frames (~1 s at 10 Hz) to ramp from STEER_GAIN to STEER_GAIN_MAX
+STEER_GAIN_RAMP_FRAMES = 35  # frames to ramp from STEER_GAIN to STEER_GAIN_MAX
 STEER_GAIN_TWO        = 35   # two-blob regime — gentle correction only
 ERROR_ALPHA         = 0.25   # EWMA on raw error: smaller = smoother but laggier
 TURN_SLOWDOWN       = 0.55   # at |err|=1, forward speed drops to SPEED * (1 - this).
@@ -234,10 +235,12 @@ _lost_count    = 0       # consecutive frames with no usable detection
 _locked_side   = None    # "left"|"right"|None — sticky identity for single-blob mode;
                          # set on first single-blob frame, cleared when both blobs reappear
 _one_blob_frames    = 0       # consecutive frames spent in one_left or one_right
+_last_regime        = None    # regime from the previous inference frame
 _barrier_turning    = False   # True while executing a barrier pivot manoeuvre
-_barrier_direction  = None   # "left"|"right" — which way to pivot during barrier
-_barrier_flip_count = 0      # how many direction flips in the current barrier event
-_barrier_turn_start = 0.0    # monotonic time when the current pivot direction started
+_barrier_direction  = None    # "left"|"right" — which way to pivot during barrier
+_barrier_flip_count = 0       # how many direction flips in the current barrier event
+_barrier_turn_start = 0.0     # monotonic time when the current pivot direction started
+_barrier_stuck      = False   # latched after flip exhaustion; clears only when barrier condition clears
 
 
 def reset_steering_state():
@@ -246,7 +249,7 @@ def reset_steering_state():
     property and a good estimate from the previous run beats the default."""
     global _prev_left_x, _prev_right_x, _error_ewma, _lost_count, _locked_side
     global _barrier_turning, _barrier_direction, _barrier_flip_count, _barrier_turn_start
-    global _one_blob_frames
+    global _barrier_stuck, _one_blob_frames, _last_regime
     _prev_left_x        = None
     _prev_right_x       = None
     _error_ewma         = 0.0
@@ -256,7 +259,20 @@ def reset_steering_state():
     _barrier_direction  = None
     _barrier_flip_count = 0
     _barrier_turn_start = 0.0
+    _barrier_stuck      = False
     _one_blob_frames    = 0
+    _last_regime        = None
+
+
+def _reset_for_barrier_exit():
+    """Clear sticky lane state when leaving barrier mode.
+    Pre-pivot coordinates and locks are stale — start the next steering frame clean."""
+    global _prev_left_x, _prev_right_x, _error_ewma, _lost_count, _locked_side
+    _prev_left_x  = None
+    _prev_right_x = None
+    _error_ewma   = 0.0
+    _lost_count   = 0
+    _locked_side  = None
 
 
 def decide_steering(mask):
@@ -295,9 +311,16 @@ def decide_steering(mask):
         if stats[i, cv2.CC_STAT_AREA] >= MIN_BLOB_AREA
     ]
 
+    # ── Regime: barrier — column projection ──────────────────────────────────
+    # Count columns where at least BARRIER_COL_MIN_PX strip rows are tape.
+    # A true horizontal bar fills columns edge-to-edge; two separated lane blobs
+    # leave a gap that keeps filled_cols well below the threshold.
+    col_counts  = bottom.sum(axis=0)
+    filled_cols = int((col_counts >= BARRIER_COL_MIN_PX).sum())
+
     debug = {"left_x": None, "right_x": None, "lane_x": None,
              "lane_width": _lane_width_px, "n_blobs": len(blobs),
-             "barrier_dir": None}
+             "barrier_dir": None, "filled_cols": filled_cols}
 
     # ── Regime: lost ──────────────────────────────────────────────────────────
     if not blobs:
@@ -309,19 +332,12 @@ def decide_steering(mask):
             _error_ewma   = 0.0
         return _error_ewma, "lost", debug
 
-    # ── Regime: barrier — single connected blob spanning 80%+ of frame width ─
-    # A 90° corner tape appears as one wide connected blob. Two separate lane
-    # boundaries will never individually be this wide.
-    for cx, area, blob_w, blob_left, bottom_y in blobs:
-        if blob_w > BARRIER_WIDTH_FRAC * w:
-            # Count tape pixels in each half of the strip.
-            # The side with fewer pixels has less tape → more open space → turn that way.
-            # This naturally accounts for distance: closer tape is larger in the frame.
-            left_px  = int(bottom[:, :w // 2].sum())
-            right_px = int(bottom[:, w // 2:].sum())
-            debug["barrier_dir"] = "right" if right_px <= left_px else "left"
-            debug["lane_x"] = w / 2
-            return 0.0, "barrier", debug
+    if filled_cols > BARRIER_WIDTH_FRAC * w:
+        left_px  = int(bottom[:, :w // 2].sum())
+        right_px = int(bottom[:, w // 2:].sum())
+        debug["barrier_dir"] = "right" if right_px <= left_px else "left"
+        debug["lane_x"]      = w / 2
+        return 0.0, "barrier", debug
 
     _lost_count = 0
     blobs_sorted = sorted(blobs, key=lambda b: b[0])  # sort by centroid X
@@ -395,7 +411,7 @@ def decide_steering(mask):
 def inference_loop():
     global annotated_frame, last_inference_ts
     global _barrier_turning, _barrier_direction, _barrier_flip_count, _barrier_turn_start
-    global _one_blob_frames
+    global _barrier_stuck, _one_blob_frames, _last_regime
     while True:
         try:
             # Grab the most recent frame (non-blocking — skip if nothing new yet)
@@ -424,28 +440,34 @@ def inference_loop():
             left_duty = right_duty = 0
             use_normal_steering = False
 
+            # Clear stuck latch the first frame the barrier condition actually clears.
+            if is_autonomous and _barrier_stuck and regime != "barrier":
+                _barrier_stuck = False
+
             if not is_autonomous:
                 stop_motors()
                 _barrier_turning    = False
                 _barrier_direction  = None
                 _barrier_flip_count = 0
+                _barrier_stuck      = False
                 _one_blob_frames    = 0
             elif _barrier_turning:
                 now = time.monotonic()
-                if regime == "two":
-                    # Found the opening — resume normal driving.
+                if regime in ("two", "one_left", "one_right"):
+                    # Pivot exposed a usable lane — exit and start clean.
                     _barrier_turning    = False
                     _barrier_direction  = None
                     _barrier_flip_count = 0
+                    _reset_for_barrier_exit()
                     use_normal_steering = True
                 elif now - _barrier_turn_start > BARRIER_FLIP_TIMEOUT:
                     if _barrier_flip_count >= BARRIER_MAX_FLIPS:
-                        # No progress after several flips — give up and stop.
+                        # No progress — give up. Stuck latch prevents immediate re-arm.
                         _barrier_turning    = False
                         _barrier_flip_count = 0
+                        _barrier_stuck      = True
                         stop_motors()
                     else:
-                        # Try the other direction.
                         _barrier_direction  = "left" if _barrier_direction == "right" else "right"
                         _barrier_flip_count += 1
                         _barrier_turn_start = now
@@ -460,7 +482,12 @@ def inference_loop():
                     else:
                         left_duty, right_duty = -BARRIER_SPEED, BARRIER_SPEED
                     drive(left_duty, right_duty)
-            elif regime == "barrier":
+            elif regime == "barrier" and _barrier_stuck:
+                # Flip-exhausted — stay stopped until the barrier condition clears.
+                stop_motors()
+            elif regime == "barrier" and _last_regime not in ("one_left", "one_right"):
+                # Only enter barrier mode from two-blob or lost — mid-turn one-blob
+                # detections are turns, not walls.
                 _barrier_turning    = True
                 _barrier_direction  = dbg.get("barrier_dir") or "right"
                 _barrier_flip_count = 0
@@ -505,10 +532,16 @@ def inference_loop():
                 cv2.circle(vis, (fx, fy), 8, (0, 255, 255), -1)
                 cv2.line(vis, (frame.shape[1] // 2, fy - 20),
                               (frame.shape[1] // 2, fy + 20), (255, 255, 255), 1)
-            auto_str  = "AUTO" if is_autonomous else "IDLE"
+            auto_str = "AUTO" if is_autonomous else "IDLE"
+            if _barrier_stuck:
+                mode_tag = "  [STUCK]"
+            elif _barrier_turning:
+                mode_tag = "  [BARRIER]"
+            else:
+                mode_tag = ""
             label1 = (f"{auto_str}  regime:{regime}  err:{error:+.2f}"
-                      f"  L:{int(left_duty)} R:{int(right_duty)}")
-            label2 = (f"blobs:{dbg['n_blobs']}  lane_w:{int(dbg['lane_width'])}"
+                      f"  L:{int(left_duty)} R:{int(right_duty)}{mode_tag}")
+            label2 = (f"blobs:{dbg['n_blobs']}  cols:{dbg['filled_cols']}"
                       f"  lost:{_lost_count}  conf:{max_conf:.2f}")
             cv2.putText(vis, label1, (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
@@ -518,6 +551,7 @@ def inference_loop():
             with annotated_lock:
                 annotated_frame = vis
 
+            _last_regime      = regime
             last_inference_ts = time.monotonic()
             time.sleep(0.1)   # ~10 Hz — reduces GPU/CPU load and battery drain
         except Exception as e:
