@@ -19,3 +19,11 @@ def load_checkpoint(path, device="cpu"):
     model.load_state_dict(torch.load(path, map_location=device), strict=False)
     model.to(device)
     return model
+
+
+def load_trt_checkpoint(path):
+    """Load a TensorRT engine produced by convert_trt.py. CUDA only."""
+    from torch2trt import TRTModule
+    model = TRTModule()
+    model.load_state_dict(torch.load(path))
+    return model

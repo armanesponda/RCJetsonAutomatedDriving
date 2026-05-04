@@ -16,11 +16,12 @@ import torchvision.transforms.functional as TF
 import Jetson.GPIO as GPIO
 from flask import Flask, Response, render_template_string
 
-from model import load_checkpoint
+from model import load_checkpoint, load_trt_checkpoint
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "best_model.pth"
+TRT_PATH   = "best_model_trt.pth"
 INPUT_SIZE = (640, 360)   # width, height fed to the model
 PORT       = 5000
 SPEED          = 30   # base forward duty cycle (0–100); both wheels at this on a perfect straight
@@ -475,7 +476,9 @@ def inference_loop():
             # --- Inference ---
             tensor = preprocess(frame).to(DEVICE)
             with torch.no_grad():
-                out = model(tensor)["out"]          # [1, 2, H, W]  (logits)
+                result = model(tensor)
+                # TRT engine returns a tensor directly; PyTorch model returns a dict.
+                out = result["out"] if isinstance(result, dict) else result
 
             probs     = F.softmax(out, dim=1)       # convert logits → probabilities
             lane_prob = probs[0, 1]                 # [H, W]  probability of lane class
@@ -799,10 +802,22 @@ atexit.register(lambda: GPIO.cleanup())
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print(f"Loading {MODEL_PATH} on {DEVICE} …")
-    model = load_checkpoint(MODEL_PATH, device=DEVICE)
-    model.eval()
-    print("Model ready.")
+    if os.path.exists(TRT_PATH):
+        try:
+            print(f"Loading TensorRT engine from {TRT_PATH} …")
+            model = load_trt_checkpoint(TRT_PATH)
+            print("TensorRT engine ready.")
+        except Exception as e:
+            print(f"TRT load failed ({e}), falling back to PyTorch …")
+            model = load_checkpoint(MODEL_PATH, device=DEVICE)
+            model.eval()
+            print("PyTorch model ready.")
+    else:
+        print(f"No TRT engine found — loading {MODEL_PATH} on {DEVICE} …")
+        print("Run python3 convert_trt.py once to build the TRT engine.")
+        model = load_checkpoint(MODEL_PATH, device=DEVICE)
+        model.eval()
+        print("Model ready.")
 
     threading.Thread(target=capture_loop,   daemon=True).start()
     threading.Thread(target=inference_loop, daemon=True).start()
