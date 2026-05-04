@@ -2,6 +2,7 @@ import os
 os.environ['JETSON_MODEL'] = 'JETSON_ORIN_NANO'
 
 import atexit
+import datetime
 import signal
 import sys
 import threading
@@ -73,6 +74,56 @@ IN3 = 16   # Right forward    (board pin 36)
 IN4 = 20   # Right backward   (board pin 38)
 
 MIN_BLOB_AREA = 200 #for smaller blobs that are noise
+
+
+# ── Per-frame CSV log ─────────────────────────────────────────────────────────
+# One row per inference iteration. Designed to be grep'd / pasted back so we
+# can see what the algorithm actually thought during a bad turn instead of
+# guessing. Line-buffered so a crash doesn't lose the last few seconds.
+LOG_COLUMNS = (
+    "t,auto,regime,err_raw,err_ewma,locked,n_blobs,lane_x,lane_w,"
+    "prev_lx,prev_rx,cols,conf,L,R,bar_turn,bar_dir,bar_flips,bar_stuck,"
+    "last_dir,obs_cx,obs_area"
+)
+_log_path  = f"driving_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+_log_fh    = open(_log_path, "w", buffering=1)
+_log_fh.write(LOG_COLUMNS + "\n")
+_log_start = time.monotonic()
+print(f"Logging to {_log_path}")
+
+
+def _log_row(is_autonomous, regime, dbg, error, max_conf,
+             left_duty, right_duty, obstacle):
+    def _f(v, fmt=".3f"):
+        return "" if v is None else format(v, fmt)
+    obs_cx, obs_area = ("", "")
+    if obstacle is not None:
+        obs_cx, obs_area = f"{obstacle[0]:.3f}", f"{int(obstacle[1])}"
+    row = (
+        f"{time.monotonic() - _log_start:.3f},"
+        f"{int(bool(is_autonomous))},"
+        f"{regime},"
+        f"{_f(dbg.get('raw_error'))},"
+        f"{error:.3f},"
+        f"{dbg.get('locked') or ''},"
+        f"{dbg.get('n_blobs', 0)},"
+        f"{_f(dbg.get('lane_x'), '.1f')},"
+        f"{_f(dbg.get('lane_width'), '.1f')},"
+        f"{_f(dbg.get('left_x'), '.1f')},"
+        f"{_f(dbg.get('right_x'), '.1f')},"
+        f"{dbg.get('filled_cols', 0)},"
+        f"{max_conf:.2f},"
+        f"{int(left_duty)},"
+        f"{int(right_duty)},"
+        f"{int(_barrier_turning)},"
+        f"{_barrier_direction or ''},"
+        f"{_barrier_flip_count},"
+        f"{int(_barrier_stuck)},"
+        f"{_last_turn_dir or ''},"
+        f"{obs_cx},"
+        f"{obs_area}\n"
+    )
+    _log_fh.write(row)
 
 
 # ── SoftPWM ────────────────────────────────────────────────────────────────────
@@ -333,7 +384,8 @@ def decide_steering(mask):
 
     debug = {"left_x": None, "right_x": None, "lane_x": None,
              "lane_width": _lane_width_px, "n_blobs": len(blobs),
-             "barrier_dir": None, "filled_cols": filled_cols}
+             "barrier_dir": None, "filled_cols": filled_cols,
+             "raw_error": None, "locked": _locked_side}
 
     # ── Regime: lost ──────────────────────────────────────────────────────────
     if not blobs:
@@ -412,10 +464,12 @@ def decide_steering(mask):
     raw_error = max(-1.0, min(1.0, raw_error))
     _error_ewma = ERROR_ALPHA * _error_ewma + (1 - ERROR_ALPHA) * raw_error
 
-    debug["lane_x"]   = lane_x
-    debug["left_x"]   = _prev_left_x
-    debug["right_x"]  = _prev_right_x
+    debug["lane_x"]    = lane_x
+    debug["left_x"]    = _prev_left_x
+    debug["right_x"]   = _prev_right_x
     debug["lane_width"] = _lane_width_px
+    debug["raw_error"] = raw_error
+    debug["locked"]    = _locked_side
     return _error_ewma, regime, debug
 
 # ── Obstacle detection (red color threshold) ──────────────────────────────────
@@ -637,6 +691,9 @@ def inference_loop():
             with annotated_lock:
                 annotated_frame = vis
 
+            _log_row(is_autonomous, regime, dbg, error, max_conf,
+                     left_duty, right_duty, obstacle)
+
             last_inference_ts = time.monotonic()
             time.sleep(0.1)   # ~10 Hz — reduces GPU/CPU load and battery drain
         except Exception as e:
@@ -790,6 +847,10 @@ def shutdown(sig, frame):
         pwm_right.stop()
         GPIO.cleanup()
         cap.release()
+        try:
+            _log_fh.close()
+        except Exception:
+            pass
     except Exception as e:
         print(f"shutdown error: {e}")
     sys.exit(0)
