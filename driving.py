@@ -52,6 +52,13 @@ INSIDE_REVERSE_CAP  = 0      # disabled — inside wheel only slows, never rever
 BARRIER_WIDTH_FRAC  = 0.85   # single blob wider than this fraction of frame → horizontal barrier
 LANE_WIDTH_DEFAULT  = 0.60   # initial lane width as a fraction of frame width
 LANE_WIDTH_ALPHA    = 0.85   # EWMA on lane-width estimate (slow update)
+LANE_W_FRAGMENT_FRAC = 0.7   # if a two-blob frame's observed width drops below this
+                             # fraction of the running lane-width estimate, the second
+                             # blob is almost certainly a fragment of the same tape line
+                             # rather than the opposite boundary. Treat the frame as
+                             # one-blob using the locked side, so a noisy segmentation
+                             # can't lurch lane_x or corrupt prev_lx/prev_rx anchors.
+                             # Skipped on bootstrap (before any valid two-blob frame).
 SIDE_FLIP_PX        = 80     # in single-blob mode, the locked side flips only after the
                              # blob has crossed this far past camera center (hysteresis).
                              # Prevents both oscillation when blob is near center AND wrong
@@ -289,6 +296,7 @@ def overlay_mask(frame, mask):
 _prev_left_x   = None    # last known x of left  boundary (in mask coords)
 _prev_right_x  = None    # last known x of right boundary (in mask coords)
 _lane_width_px = None    # running estimate of lane width in pixels (mask coords)
+_lane_width_seeded = False   # True once a non-degenerate two-blob frame has updated _lane_width_px
 _error_ewma    = 0.0     # smoothed steering error in [-1, +1]
 _lost_count    = 0       # consecutive frames with no usable detection
 _locked_side   = None    # "left"|"right"|None — sticky identity for single-blob mode;
@@ -341,7 +349,8 @@ def decide_steering(mask):
       regime ∈ {"two", "one_left", "one_right", "lost"}
       debug  — dict for the on-screen overlay (lane_x, left_x, right_x, lane_width)
     """
-    global _prev_left_x, _prev_right_x, _lane_width_px, _error_ewma, _lost_count, _locked_side
+    global _prev_left_x, _prev_right_x, _lane_width_px, _lane_width_seeded
+    global _error_ewma, _lost_count, _locked_side
 
     mask_u8 = mask.astype(np.uint8)
     h, w = mask_u8.shape
@@ -407,6 +416,20 @@ def decide_steering(mask):
     _lost_count = 0
     blobs_sorted = sorted(blobs, key=lambda b: b[0])  # sort by centroid X
 
+    # Collapse fragmented two-blob frames into one-blob: when both visible blobs
+    # sit far closer together than the running lane width, they're almost
+    # certainly one tape that segmented in two. Using their midpoint as lane_x
+    # lurches the steering target and corrupts prev_lx/prev_rx, which then
+    # mislocks the next single-blob frame. Keep only the blob on the currently
+    # locked side so the stable anchors carry through the noisy frame.
+    if (len(blobs_sorted) >= 2 and _lane_width_seeded
+            and (blobs_sorted[-1][0] - blobs_sorted[0][0])
+                < LANE_W_FRAGMENT_FRAC * _lane_width_px):
+        if _locked_side == "right":
+            blobs_sorted = [blobs_sorted[-1]]
+        else:
+            blobs_sorted = [blobs_sorted[0]]
+
     # ── Regime: two or more blobs — use outermost as the two boundaries ──────
     if len(blobs_sorted) >= 2:
         left_x  = blobs_sorted[0][0]
@@ -418,6 +441,7 @@ def decide_steering(mask):
         if observed_width > 0.2 * w:
             _lane_width_px = (LANE_WIDTH_ALPHA * _lane_width_px
                               + (1 - LANE_WIDTH_ALPHA) * observed_width)
+            _lane_width_seeded = True
         _prev_left_x, _prev_right_x = left_x, right_x
         lane_x = (left_x + right_x) / 2
         regime = "two"
